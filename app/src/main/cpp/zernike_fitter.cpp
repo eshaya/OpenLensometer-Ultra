@@ -2,6 +2,53 @@
 #include "zernike_fitter.h"
 #include <Eigen/Dense>
 #include <cmath>
+#include <vector>
+
+float extract_defocus(const cv::Mat& phase_map) {
+    if (phase_map.empty()) return 0.0f;
+
+    int rows = phase_map.rows;
+    int cols = phase_map.cols;
+    float cx = cols / 2.0f;
+    float cy = rows / 2.0f;
+
+    std::vector<float> r2_vals;
+    std::vector<float> phase_vals;
+
+    // 1. Flatten the valid pixels (within the unit circle) into 1D vectors
+    for (int y = 0; y < rows; ++y) {
+        for (int x = 0; x < cols; ++x) {
+            float dx = (x - cx) / cx;
+            float dy = (y - cy) / cy;
+            float r2 = dx * dx + dy * dy;
+
+            if (r2 <= 1.0f) {
+                r2_vals.push_back(r2);
+                phase_vals.push_back(phase_map.at<float>(y, x));
+            }
+        }
+    }
+
+    if (r2_vals.empty()) return 0.0f;
+
+    // 2. Setup Eigen matrices for least-squares fitting: A * x = b
+    // A has 2 columns: Column 0 is Piston (1.0), Column 1 is Defocus (r^2)
+    Eigen::MatrixXf A(r2_vals.size(), 2);
+    Eigen::VectorXf b(phase_vals.size());
+
+    for (size_t i = 0; i < r2_vals.size(); ++i) {
+        A(i, 0) = 1.0f;           // Piston term
+        A(i, 1) = r2_vals[i];     // Defocus term
+        b(i) = phase_vals[i];     // Actual measured phase
+    }
+
+    // 3. Solve for the coefficients using SVD
+    Eigen::VectorXf coeffs = A.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b);
+
+    // coeffs(0) is the Piston offset
+    // coeffs(1) is the Defocus coefficient
+    return coeffs(1);
+}
 
 OpticalPrescription fitZernikeAndExtractPrescription(const cv::Mat& unwrappedPhase, 
                                                      const cv::Mat& mask, 

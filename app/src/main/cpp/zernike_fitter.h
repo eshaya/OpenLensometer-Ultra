@@ -5,6 +5,9 @@
 #include <opencv2/opencv.hpp>
 #include <vector>
 
+// Extracts the Defocus (r^2) optical power coefficient from a raw phase map
+float extract_defocus(const cv::Mat& phase_map);
+
 // Struct to hold the final optometric results
 struct OpticalPrescription {
     float sphere;

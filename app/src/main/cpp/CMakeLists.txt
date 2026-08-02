@@ -1,36 +1,84 @@
 # File: lensometer-engine/src/main/cpp/CMakeLists.txt
-cmake_minimum_required(VERSION 3.10.2)[cite: 1]
+cmake_minimum_required(VERSION 3.10.2)
 
-project("lensometer_engine")[cite: 1]
+project("lensometer_engine")
 
 # NDK r26c supports modern C++ features required by Eigen
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Point directly to your OpenCV SDK path as you had it configured
-set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/opencv/sdk/native/jni)[cite: 1]
-find_package(OpenCV REQUIRED)[cite: 1]
+# ---------------------------------------------------------
+# CONDITIONAL DEPENDENCIES (OpenCV & Eigen)
+# ---------------------------------------------------------
+if(ANDROID)
+    # Gradle Android Build: Point to your local Android paths
+    set(OpenCV_DIR ${CMAKE_SOURCE_DIR}/opencv/sdk/native/jni)
+    include_directories(${CMAKE_SOURCE_DIR}/eigen)
+else()
+    # Local Linux Tests: Use system paths
+    include_directories(/usr/include/eigen3)
+endif()
 
-# Include Eigen exactly as you mapped it
-include_directories(${CMAKE_SOURCE_DIR}/eigen)[cite: 1]
+# Find and include for both environments
+find_package(OpenCV REQUIRED)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
-# Add all the cpp files you explicitly listed
-add_library(
-        lensometer_engine[cite: 1]
-        SHARED[cite: 1]
-        lensometer_engine.cpp[cite: 1]
-        depth16_filter.cpp[cite: 1]
-        phase_unwrapper.cpp[cite: 1]
-        zernike_fitter.cpp[cite: 1]
-        charuco_calibrator.cpp[cite: 1]
+# Add all the cpp files for the Android library
+# ==========================================
+# ANDROID JNI LIBRARY
+# ==========================================
+if(ANDROID)
+    # Add all the cpp files for the Android library
+    add_library(
+            lensometer_engine
+            SHARED
+            lensometer_engine.cpp
+            depth16_filter.cpp
+            phase_unwrapper.cpp
+            zernike_fitter.cpp
+            charuco_calibrator.cpp
+            wavefront_calibrator.cpp
+    )
+
+    # Link everything together for the Android build
+    target_link_libraries(
+            lensometer_engine
+            ${OpenCV_LIBS}
+            log
+            jnigraphics 
+            android 
+    )
+endif()
+# ==========================================
+# Unit Testing Configuration (GoogleTest)
+# ==========================================
+
+# Enable testing in CMake
+enable_testing()
+
+# Fetch GoogleTest directly from GitHub
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  GIT_REPOSITORY https://github.com/google/googletest.git
+  GIT_TAG        release-1.12.1
+)
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+
+# Create the test executable
+add_executable(
+    lensometer_tests
+    test_lensometer.cpp
+    zernike_fitter.cpp
+    phase_unwrapper.cpp
+    wavefront_calibrator.cpp 
+    charuco_calibrator.cpp
 )
 
-# Link everything together
+# Link GTest and OpenCV to your test executable
 target_link_libraries(
-        lensometer_engine[cite: 1]
-        ${OpenCV_LIBS}[cite: 1]
-        log[cite: 1]
-        jnigraphics[cite: 1] 
-        android # Kept this as it is required for the new DirectByteBuffer zero-copy access
+    lensometer_tests
+    gtest_main
+    ${OpenCV_LIBS}
 )

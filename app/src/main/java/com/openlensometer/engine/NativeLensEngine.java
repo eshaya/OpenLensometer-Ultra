@@ -9,6 +9,10 @@ public class NativeLensEngine {
         System.loadLibrary("lensometer_engine");
     }
 
+    // A lightweight ping test to verify the JNI bridge is alive
+    public native String pingEngine();
+
+
     /**
      * Calibrates the physical geometry of the screen using a ChArUco board.
      * 

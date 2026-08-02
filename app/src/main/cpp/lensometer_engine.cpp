@@ -1,5 +1,6 @@
 // File: app/src/main/cpp/lensometer_engine.cpp
 #include <jni.h>
+#include <strings>
 #include <android/log.h>
 #include <opencv2/opencv.hpp>
 
@@ -39,8 +40,20 @@ jobject createJavaLensResult(JNIEnv* env, float sphere, float cylinder, float ax
 }
 
 
+// JNI functions must be wrapped in extern "C" to prevent C++ name mangling
+extern "C" {
+
+JNIEXPORT jstring JNICALL
+Java_com_iglasses_openlensometer_NativeLensEngine_pingEngine(
+    JNIEnv* env, 
+    jobject /* this */) 
+{
+    std::string status = "JNI Bridge Active: C++ Math Engine Ready";
+    return env->NewStringUTF(status.c_str());
+}
+
 // =========================================================================
-// [NEW] ChArUco Hardware Calibrator
+//  ChArUco Hardware Calibrator
 // =========================================================================
 extern "C" JNIEXPORT jfloat JNICALL
 Java_com_openlensometer_engine_NativeLensEngine_calibrateMonitor(
@@ -198,4 +211,5 @@ Java_com_openlensometer_engine_NativeLensEngine_releaseEmptyField(
         cv::Mat* mat = reinterpret_cast<cv::Mat*>(emptyFieldPtr);
         delete mat;
     }
+}
 }
