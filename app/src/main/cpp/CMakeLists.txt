@@ -10,6 +10,7 @@ add_library(
         SHARED
         lensometer_engine.cpp
         depth16_filter.cpp
+	phase_unwrapper.cpp
 )
 
 target_link_libraries(
