@@ -18,4 +18,16 @@ void calculateWrappedPhase(const cv::Mat& I1, const cv::Mat& I2,
                            const cv::Mat& I3, const cv::Mat& I4, 
                            cv::Mat& wrappedPhase, cv::Mat& modulationMap);
 
+/**
+ * Unwraps the phase using a Quality-Guided Flood-Fill algorithm.
+ * Routes around temples and noise by prioritizing high-modulation pixels.
+ * 
+ * @param wrappedPhase The input wrapped phase [-pi, pi]
+ * @param modulationMap The contrast quality map
+ * @param unwrappedPhase Output: The continuous unwrapped phase map
+ * @param modThreshold Minimum modulation required to process a pixel (masks out temples)
+ */
+void unwrapPhaseQualityGuided(const cv::Mat& wrappedPhase, const cv::Mat& modulationMap, 
+		cv::Mat& unwrappedPhase, float modThreshold = 5.0f);
+
 #endif // PHASE_UNWRAPPER_H

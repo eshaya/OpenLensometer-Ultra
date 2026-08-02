@@ -1,34 +1,80 @@
 // File: app/src/main/cpp/phase_unwrapper.cpp
 #include "phase_unwrapper.h"
+#include <queue>
+#include <vector>
 
-void calculateWrappedPhase(const cv::Mat& I1, const cv::Mat& I2, 
-                           const cv::Mat& I3, const cv::Mat& I4, 
-                           cv::Mat& wrappedPhase, cv::Mat& modulationMap) {
-                               
-    // 1. Convert 8-bit YUV channels to 32-bit floats for accurate math
-    cv::Mat f1, f2, f3, f4;
-    I1.convertTo(f1, CV_32F);
-    I2.convertTo(f2, CV_32F);
-    I3.convertTo(f3, CV_32F);
-    I4.convertTo(f4, CV_32F);
-
-    // 2. Calculate Numerator and Denominator for the arctangent
-    cv::Mat num = f4 - f2;
-    cv::Mat den = f1 - f3;
-
-    // 3. Extract the Wrapped Phase
-    // cv::phase computes arctan2 highly efficiently using ARM SIMD instructions.
-    // The 'false' parameter ensures the output is in radians [0, 2pi].
-    cv::phase(den, num, wrappedPhase, false); 
+// Helper struct for the Priority Queue
+struct PixelNode {
+    int x, y;
+    float modulation;
     
-    // Standardize the phase range to [-pi, pi] for standard unwrapping algorithms
-    wrappedPhase -= CV_PI;
+    // We want the highest modulation at the top of the queue
+    bool operator<(const PixelNode& other) const {
+        return modulation < other.modulation; 
+    }
+};
 
-    // 4. Extract the Modulation Map
-    // This tells us the contrast of the fringes at every pixel. 
-    // Pixels over the temples or background will have very low modulation, 
-    // allowing us to easily mask them out and ignore them in the next steps.
-    cv::Mat magnitude;
-    cv::magnitude(den, num, magnitude);
-    modulationMap = magnitude / 2.0f;
+// Helper function to resolve the 2-pi jumps between adjacent pixels
+inline float wrapDifference(float phase, float referencePhase) {
+    float diff = phase - referencePhase;
+    while (diff > CV_PI)  diff -= 2.0f * CV_PI;
+    while (diff < -CV_PI) diff += 2.0f * CV_PI;
+    return referencePhase + diff;
+}
+
+void unwrapPhaseQualityGuided(const cv::Mat& wrappedPhase, const cv::Mat& modulationMap, 
+                              cv::Mat& unwrappedPhase, float modThreshold) {
+    
+    int rows = wrappedPhase.rows;
+    int cols = wrappedPhase.cols;
+    
+    // Initialize output map and a tracking mask
+    unwrappedPhase = cv::Mat::zeros(rows, cols, CV_32F);
+    cv::Mat processed = cv::Mat::zeros(rows, cols, CV_8U);
+    
+    // 1. Find the best starting seed (Highest modulation)
+    double minVal, maxVal;
+    cv::Point minLoc, maxLoc;
+    cv::minMaxLoc(modulationMap, &minVal, &maxVal, &minLoc, &maxLoc);
+    
+    std::priority_queue<PixelNode> pq;
+    
+    // 2. Initialize the seed
+    unwrappedPhase.at<float>(maxLoc.y, maxLoc.x) = wrappedPhase.at<float>(maxLoc.y, maxLoc.x);
+    processed.at<uchar>(maxLoc.y, maxLoc.x) = 1;
+    pq.push({maxLoc.x, maxLoc.y, static_cast<float>(maxVal)});
+    
+    // 4-connected neighborhood offsets (Up, Down, Left, Right)
+    int dx[] = {0, 0, -1, 1};
+    int dy[] = {-1, 1, 0, 0};
+    
+    // 3. Flood-fill from highest quality to lowest
+    while (!pq.empty()) {
+        PixelNode current = pq.top();
+        pq.pop();
+        
+        float refPhase = unwrappedPhase.at<float>(current.y, current.x);
+        
+        for (int i = 0; i < 4; ++i) {
+            int nx = current.x + dx[i];
+            int ny = current.y + dy[i];
+            
+            // Bounds check
+            if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) {
+                // If not yet processed AND modulation is above our temple-masking threshold
+                if (processed.at<uchar>(ny, nx) == 0 && modulationMap.at<float>(ny, nx) >= modThreshold) {
+                    
+                    // Read the wrapped value of the neighbor
+                    float neighborWrapped = wrappedPhase.at<float>(ny, nx);
+                    
+                    // Unwrap it relative to the current pixel
+                    unwrappedPhase.at<float>(ny, nx) = wrapDifference(neighborWrapped, refPhase);
+                    
+                    // Mark as processed and add to queue
+                    processed.at<uchar>(ny, nx) = 1;
+                    pq.push({nx, ny, modulationMap.at<float>(ny, nx)});
+                }
+            }
+        }
+    }
 }

@@ -11,6 +11,8 @@ add_library(
         lensometer_engine.cpp
         depth16_filter.cpp
 	phase_unwrapper.cpp
+	zernike_fitter.cpp
+	charuco_calibrator.cpp
 )
 
 target_link_libraries(
