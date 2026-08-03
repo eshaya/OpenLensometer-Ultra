@@ -50,35 +50,36 @@ if(ANDROID)
     )
 endif()
 # ==========================================
-# Unit Testing Configuration (GoogleTest)
+# Unit Testing Configuration (Host Build Only)
 # ==========================================
+if(NOT ANDROID)
+    enable_testing()
 
-# Enable testing in CMake
-enable_testing()
+    include(FetchContent)
+    FetchContent_Declare(
+      googletest
+      GIT_REPOSITORY https://github.com/google/googletest.git
+      GIT_TAG        release-1.12.1
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
 
-# Fetch GoogleTest directly from GitHub
-include(FetchContent)
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG        release-1.12.1
-)
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
+    # Create the host test executable
+    add_executable(
+        lensometer_tests
+        test_lensometer.cpp
+        zernike_fitter.cpp
+        phase_unwrapper.cpp
+        wavefront_calibrator.cpp 
+        charuco_calibrator.cpp
+    )
 
-# Create the test executable
-add_executable(
-    lensometer_tests
-    test_lensometer.cpp
-    zernike_fitter.cpp
-    phase_unwrapper.cpp
-    wavefront_calibrator.cpp 
-    charuco_calibrator.cpp
-)
-
-# Link GTest and OpenCV to your test executable
-target_link_libraries(
-    lensometer_tests
-    gtest_main
-    ${OpenCV_LIBS}
-)
+    target_link_libraries(
+        lensometer_tests
+        gtest_main
+        ${OpenCV_LIBS}
+    )
+    
+    include(GoogleTest)
+    gtest_discover_tests(lensometer_tests)
+endif()

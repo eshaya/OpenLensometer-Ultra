@@ -44,7 +44,7 @@ jobject createJavaLensResult(JNIEnv* env, float sphere, float cylinder, float ax
 extern "C" {
 
 JNIEXPORT jstring JNICALL
-Java_com_iglasses_openlensometer_NativeLensEngine_pingEngine(
+Java_com_openlensometer_engine_NativeLensEngine_pingEngine(
     JNIEnv* env, 
     jobject /* this */) 
 {

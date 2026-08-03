@@ -12,7 +12,6 @@ public class NativeLensEngine {
     // A lightweight ping test to verify the JNI bridge is alive
     public native String pingEngine();
 
-
     /**
      * Calibrates the physical geometry of the screen using a ChArUco board.
      * 
@@ -67,3 +66,4 @@ public class NativeLensEngine {
      */
     public native void releaseEmptyField(long emptyFieldPtr);
 }
+

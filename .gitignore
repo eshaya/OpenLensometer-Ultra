@@ -1,12 +1,27 @@
-*.iml
-.gradle
-/local.properties
-/.idea/
+# .gitignore
+*.swp
+*~
+.gradle/
+build/
+app/build/
+app/src/main/cpp/build/
+.cxx/
 .DS_Store
-/build
 /captures
 .externalNativeBuild
-.cxx
 
-# Ignore Gradle build output directory
-build
+
+# Android / Gradle build folders
+build/
+.gradle/
+.idea/
+.cxx/
+local.properties
+*.iml
+
+# App binaries
+*.apk
+*.aab
+
+# C++ CMake build folders
+app/src/main/cpp/build/
