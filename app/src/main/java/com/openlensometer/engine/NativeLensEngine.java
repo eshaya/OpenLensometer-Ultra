@@ -12,6 +12,23 @@ public class NativeLensEngine {
     // A lightweight ping test to verify the JNI bridge is alive
     public native String pingEngine();
 
+    public native double calculateMonitorPixelPitch(
+            int screenWidthPixels, int screenHeightPixels, double screenDiagonalInches);
+
+    public native int detectCharucoCorners(
+            ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride);
+
+    public native int capturePhaseFrame(
+            ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride,
+            ByteBuffer depthPlane, int depthWidth, int depthHeight,
+            int depthRowStride, int depthPixelStride,
+            int axis, int phaseIndex, float focalX, float focalY,
+            float principalX, float principalY);
+
+    public native void resetPhaseCapture();
+
+    public native float[] getCapturedCameraDepthCalibration();
+
     /**
      * Calibrates the physical geometry of the screen using a ChArUco board.
      * 
@@ -28,6 +45,49 @@ public class NativeLensEngine {
             ByteBuffer yuvBuffer, int width, int height, int stride,
             float zScreenMm, float[] cameraMatrix, int monitorSquareSizePx
     );
+
+    public MonitorPitchEstimate calibrateMonitorBothWays(
+            ByteBuffer yPlane, int width, int height, int rowStride,
+            float zScreenMm, float[] cameraMatrix, int charucoSquareSizePx,
+            int screenWidthPixels, int screenHeightPixels, double screenDiagonalInches) {
+        double monitorSpecPitch = calculateMonitorPixelPitch(
+                screenWidthPixels, screenHeightPixels, screenDiagonalInches);
+        double charucoPitch = calibrateMonitor(
+                yPlane, width, height, rowStride, zScreenMm, cameraMatrix, charucoSquareSizePx);
+        return new MonitorPitchEstimate(charucoPitch, monitorSpecPitch);
+    }
+
+    public static final class MonitorPitchEstimate {
+        public final double charucoPitchMm;
+        public final double monitorSpecPitchMm;
+        public final double selectedPitchMm;
+        public final double differencePercent;
+        public final boolean selectedCharucoEstimate;
+
+        private MonitorPitchEstimate(double charucoPitchMm, double monitorSpecPitchMm) {
+            this.charucoPitchMm = isValidPitch(charucoPitchMm) ? charucoPitchMm : Double.NaN;
+            this.monitorSpecPitchMm = isValidPitch(monitorSpecPitchMm)
+                    ? monitorSpecPitchMm : Double.NaN;
+            this.selectedCharucoEstimate = Double.isFinite(this.charucoPitchMm);
+            this.selectedPitchMm = selectedCharucoEstimate
+                    ? this.charucoPitchMm : this.monitorSpecPitchMm;
+            this.differencePercent = selectedCharucoEstimate &&
+                    Double.isFinite(this.monitorSpecPitchMm)
+                    ? Math.abs(this.charucoPitchMm - this.monitorSpecPitchMm) /
+                            this.monitorSpecPitchMm * 100.0
+                    : Double.NaN;
+        }
+
+        public boolean agreesWithin(double tolerancePercent) {
+            return Double.isFinite(differencePercent) &&
+                    Double.isFinite(tolerancePercent) && tolerancePercent >= 0.0 &&
+                    differencePercent <= tolerancePercent;
+        }
+
+        private static boolean isValidPitch(double pitchMm) {
+            return Double.isFinite(pitchMm) && pitchMm > 0.0;
+        }
+    }
 
     /**
      * [OLD METHOD] Single-pass measurement without aberration removal.

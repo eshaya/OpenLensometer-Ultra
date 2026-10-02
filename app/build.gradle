@@ -8,7 +8,7 @@
 
 plugins {
     id 'com.android.application' version '8.2.2' // Add version here
-    // ... other plugins
+    id 'org.jetbrains.kotlin.android' version '1.9.22'
 }
 
 android {
@@ -44,6 +44,10 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
     externalNativeBuild {
         cmake {
             path file('src/main/cpp/CMakeLists.txt')
@@ -62,6 +66,9 @@ dependencies {
     implementation "androidx.camera:camera-camera2:${camerax_version}"
     implementation "androidx.camera:camera-lifecycle:${camerax_version}"
     implementation "androidx.camera:camera-view:${camerax_version}"
+
+    // ARCore camera frames and optional Depth API support
+    implementation 'com.google.ar:core:1.56.0'
 
     // Testing
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.0'

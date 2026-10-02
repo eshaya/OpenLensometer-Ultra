@@ -2,7 +2,12 @@
 #define CHARUCO_CALIBRATOR_H
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/core/version.hpp>
+#if CV_VERSION_MAJOR > 4 || (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR >= 7)
+#include <opencv2/objdetect/charuco_detector.hpp>
+#else
 #include <opencv2/aruco/charuco.hpp>
+#endif
 
 // Extracts the 3D translation (distance) and rotation of the screen
 bool estimate_screen_pose(

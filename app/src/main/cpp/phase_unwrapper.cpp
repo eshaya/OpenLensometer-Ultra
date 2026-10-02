@@ -22,6 +22,38 @@ inline float wrapDifference(float phase, float referencePhase) {
     return referencePhase + diff;
 }
 
+void calculateWrappedPhase(const cv::Mat& I1, const cv::Mat& I2,
+                           const cv::Mat& I3, const cv::Mat& I4,
+                           cv::Mat& wrappedPhase, cv::Mat& modulationMap) {
+    CV_Assert(!I1.empty() && !I2.empty() && !I3.empty() && !I4.empty());
+    CV_Assert(I1.size() == I2.size() && I1.size() == I3.size() && I1.size() == I4.size());
+    CV_Assert(I1.channels() == 1 && I2.channels() == 1 && I3.channels() == 1 && I4.channels() == 1);
+
+    cv::Mat frame1;
+    cv::Mat frame2;
+    cv::Mat frame3;
+    cv::Mat frame4;
+    I1.convertTo(frame1, CV_32F);
+    I2.convertTo(frame2, CV_32F);
+    I3.convertTo(frame3, CV_32F);
+    I4.convertTo(frame4, CV_32F);
+
+    const cv::Mat cosineTerm = frame1 - frame3;
+    const cv::Mat sineTerm = frame4 - frame2;
+    cv::phase(cosineTerm, sineTerm, wrappedPhase);
+
+    const float twoPi = 2.0f * static_cast<float>(CV_PI);
+    for (int row = 0; row < wrappedPhase.rows; ++row) {
+        float* phaseValues = wrappedPhase.ptr<float>(row);
+        for (int column = 0; column < wrappedPhase.cols; ++column) {
+            if (phaseValues[column] > CV_PI) phaseValues[column] -= twoPi;
+        }
+    }
+
+    cv::magnitude(cosineTerm, sineTerm, modulationMap);
+    modulationMap *= 0.5f;
+}
+
 void unwrapPhaseQualityGuided(const cv::Mat& wrappedPhase, const cv::Mat& modulationMap, 
                               cv::Mat& unwrappedPhase, float modThreshold) {
     

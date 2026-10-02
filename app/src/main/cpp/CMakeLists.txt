@@ -33,6 +33,7 @@ if(ANDROID)
             lensometer_engine
             SHARED
             lensometer_engine.cpp
+            aberration_removal.cpp
             depth16_filter.cpp
             phase_unwrapper.cpp
             zernike_fitter.cpp

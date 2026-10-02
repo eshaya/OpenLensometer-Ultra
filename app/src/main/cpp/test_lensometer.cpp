@@ -8,6 +8,45 @@
 #include "phase_unwrapper.h" 
 #include "wavefront_calibrator.h"
 #include "charuco_calibrator.h"
+#include "monitor_calibration.h"
+
+TEST(MonitorCalibrationTest, CalculatesPitchFromNativeResolutionAndDiagonal) {
+    const double pitchMm = calculateMonitorPixelPitchMm(1920, 1080, 27.0);
+    EXPECT_NEAR(pitchMm, 0.31137, 0.0001);
+}
+
+TEST(MonitorCalibrationTest, ReportsDifferenceRelativeToMonitorSpecEstimate) {
+    const double monitorSpecPitchMm = calculateMonitorPixelPitchMm(1920, 1080, 27.0);
+    const double charucoPitchMm = monitorSpecPitchMm * 1.05;
+    EXPECT_NEAR(monitorPitchDifferencePercent(charucoPitchMm, monitorSpecPitchMm), 5.0, 1e-9);
+}
+
+TEST(MonitorCalibrationTest, RejectsInvalidMonitorSpecifications) {
+    EXPECT_EQ(calculateMonitorPixelPitchMm(0, 1080, 27.0), -1.0);
+    EXPECT_EQ(calculateMonitorPixelPitchMm(1920, 1080, 0.0), -1.0);
+    EXPECT_TRUE(std::isnan(monitorPitchDifferencePercent(-1.0, 0.3)));
+}
+
+TEST(PhaseDemodulationTest, RecoversKnownPhaseAndModulation) {
+    constexpr float background = 128.0f;
+    constexpr float amplitude = 64.0f;
+    constexpr float expectedPhase = 0.75f;
+    cv::Mat frames[4];
+    for (int phaseIndex = 0; phaseIndex < 4; ++phaseIndex) {
+        frames[phaseIndex] = cv::Mat(1, 1, CV_32F);
+        const float phaseStep = phaseIndex * static_cast<float>(CV_PI / 2.0);
+        frames[phaseIndex].at<float>(0, 0) =
+            background + amplitude * std::cos(expectedPhase + phaseStep);
+    }
+
+    cv::Mat wrappedPhase;
+    cv::Mat modulationMap;
+    calculateWrappedPhase(
+        frames[0], frames[1], frames[2], frames[3], wrappedPhase, modulationMap);
+
+    EXPECT_NEAR(wrappedPhase.at<float>(0, 0), expectedPhase, 2e-4f);
+    EXPECT_NEAR(modulationMap.at<float>(0, 0), amplitude, 1e-5f);
+}
 
 TEST(ZernikeFitterTest, FitsPureDefocus) {
     int size = 4000;
