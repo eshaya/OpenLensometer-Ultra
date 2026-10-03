@@ -9,6 +9,9 @@
 #include "wavefront_calibrator.h"
 #include "charuco_calibrator.h"
 #include "monitor_calibration.h"
+#include "alignment_detector.h"
+#include "frame_stack.h"
+#include "lens_measurement.h"
 
 TEST(MonitorCalibrationTest, CalculatesPitchFromNativeResolutionAndDiagonal) {
     const double pitchMm = calculateMonitorPixelPitchMm(1920, 1080, 27.0);
@@ -46,6 +49,394 @@ TEST(PhaseDemodulationTest, RecoversKnownPhaseAndModulation) {
 
     EXPECT_NEAR(wrappedPhase.at<float>(0, 0), expectedPhase, 2e-4f);
     EXPECT_NEAR(modulationMap.at<float>(0, 0), amplitude, 1e-5f);
+}
+
+TEST(AlignmentDetectorTest, FindsBrowserTargetOverSinusoidalFringes) {
+    constexpr int width = 1920;
+    constexpr int height = 1080;
+    constexpr int fringePeriod = 64;
+    const int targetSize = static_cast<int>(std::round(std::min(width, height) * 0.10));
+    const cv::Point targetCenter(width / 2, height / 2);
+
+    for (int axis = 0; axis < 2; ++axis) {
+        for (int phase = 0; phase < 4; ++phase) {
+            cv::Mat frame(height, width, CV_8UC1);
+            const double phaseOffset = phase * CV_PI / 2.0;
+            for (int y = 0; y < height; ++y) {
+                uint8_t* row = frame.ptr<uint8_t>(y);
+                for (int x = 0; x < width; ++x) {
+                    const int position = axis == 0 ? x : y;
+                    row[x] = cv::saturate_cast<uint8_t>(
+                        127.5 + 127.5 * 0.8 * std::cos(
+                            2.0 * CV_PI * position / fringePeriod + phaseOffset));
+                }
+            }
+            const cv::Mat fringeBackground = frame.clone();
+
+            cv::circle(frame, targetCenter, targetSize / 2, cv::Scalar(0), cv::FILLED);
+            cv::circle(frame, targetCenter, static_cast<int>(targetSize * 0.4),
+                       cv::Scalar(220), cv::FILLED);
+            cv::circle(frame, targetCenter, static_cast<int>(targetSize * 0.2),
+                       cv::Scalar(0), cv::FILLED);
+
+            // Same floating-point layout as drawPhaseTicks() in the page.
+            const double cellSize = targetSize * 0.20;
+            const double cellGap = targetSize * 0.16;
+            const double margin = targetSize * 0.12;
+            const double codeWidth = cellSize * 4 + cellGap * 3;
+            const double codeLeft = targetCenter.x - codeWidth / 2;
+            const double codeTop = targetCenter.y + targetSize * 0.72;
+            const auto pixelRect = [](double left, double top, double w, double h) {
+                return cv::Rect(cvRound(left), cvRound(top),
+                                cvRound(left + w) - cvRound(left), cvRound(top + h) - cvRound(top));
+            };
+            const cv::Rect tickBounds = pixelRect(codeLeft - margin, codeTop - margin,
+                                                  codeWidth + 2 * margin, cellSize + 2 * margin);
+            cv::rectangle(frame, tickBounds, cv::Scalar(128), cv::FILLED);
+            const int phaseCode = 8 + axis * 4 + phase;
+            for (int bit = 0; bit < 4; ++bit) {
+                const cv::Rect cell = pixelRect(codeLeft + bit * (cellSize + cellGap), codeTop,
+                                                cellSize, cellSize);
+                const int intensity = (phaseCode & (1 << bit)) != 0 ? 255 : 0;
+                cv::rectangle(frame, cell, cv::Scalar(intensity), cv::FILLED);
+                cv::rectangle(frame, cell, cv::Scalar(0), 2);
+            }
+
+            cv::Point2f normalizedCenter;
+            float normalizedSize = 0.0f;
+            int detectedPhaseCode = -1;
+            ASSERT_TRUE(detectAlignmentTarget(
+                frame, normalizedCenter, normalizedSize, detectedPhaseCode))
+                << "axis=" << axis << " phase=" << phase;
+            EXPECT_NEAR(normalizedCenter.x, 0.5f, 0.01f);
+            EXPECT_NEAR(normalizedCenter.y, 0.5f, 0.01f);
+            EXPECT_GT(normalizedSize, 0.08f);
+            EXPECT_LT(normalizedSize, 0.12f);
+            EXPECT_EQ(detectedPhaseCode, phaseCode);
+
+            // As the phone camera sees it at 50 cm: bullseye ~48 px across, slightly blurred.
+            cv::Mat cameraView;
+            cv::resize(frame, cameraView, cv::Size(853, 480), 0, 0, cv::INTER_AREA);
+            cv::GaussianBlur(cameraView, cameraView, cv::Size(0, 0), 1.0);
+            cv::Point2f cameraCenter;
+            float cameraSize = 0.0f;
+            int cameraCode = -1;
+            ASSERT_TRUE(detectAlignmentTarget(cameraView, cameraCenter, cameraSize, cameraCode));
+            EXPECT_EQ(cameraCode, phaseCode) << "camera-scale axis=" << axis << " phase=" << phase;
+
+            cv::Mat hiddenBullseye = fringeBackground.clone();
+            frame(tickBounds).copyTo(hiddenBullseye(tickBounds));
+            int phaseCodeWithoutRings = -1;
+            ASSERT_TRUE(decodeAlignmentPhaseCode(
+                hiddenBullseye, normalizedCenter, normalizedSize, phaseCodeWithoutRings));
+            EXPECT_EQ(phaseCodeWithoutRings, phaseCode);
+
+            // Portrait phone: the landscape sensor image is rotated, so monitor-down
+            // points along -x in the image (ROTATE_90_CLOCKWISE maps (0,1) to (-1,0)).
+            const cv::Point2f rotatedDown(-1.0f, 0.0f);
+            cv::Mat rotatedFrame;
+            cv::rotate(frame, rotatedFrame, cv::ROTATE_90_CLOCKWISE);
+            int rotatedPhaseCode = -1;
+            ASSERT_TRUE(detectAlignmentTarget(
+                rotatedFrame, normalizedCenter, normalizedSize, rotatedPhaseCode, rotatedDown));
+            EXPECT_EQ(rotatedPhaseCode, phaseCode);
+
+            cv::Mat rotatedHidden;
+            cv::rotate(hiddenBullseye, rotatedHidden, cv::ROTATE_90_CLOCKWISE);
+            int rotatedHiddenCode = -1;
+            ASSERT_TRUE(decodeAlignmentPhaseCode(
+                rotatedHidden, normalizedCenter, normalizedSize, rotatedHiddenCode, rotatedDown));
+            EXPECT_EQ(rotatedHiddenCode, phaseCode);
+        }
+    }
+}
+
+namespace {
+
+void drawRingTarget(cv::Mat& canvas, cv::Point center, double diameterPixels) {
+    cv::circle(canvas, center, static_cast<int>(diameterPixels * 0.5), cv::Scalar(0), cv::FILLED);
+    cv::circle(canvas, center, static_cast<int>(diameterPixels * 0.4), cv::Scalar(220), cv::FILLED);
+    cv::circle(canvas, center, static_cast<int>(diameterPixels * 0.2), cv::Scalar(0), cv::FILLED);
+}
+
+// Renders the monitor-pattern-player layout (50 mm bullseye, 30 mm corner markers at ±90 mm)
+// as seen by a 640×480 camera whose pose relative to the monitor is (rotation, distance).
+cv::Mat renderMonitorView(const cv::Matx33d& rotation, double distanceMm,
+                          const cv::Matx33d& cameraMatrix, bool drawCenter = true) {
+    constexpr double mmPerPixel = 0.5;
+    constexpr int canvasSize = 600;
+    cv::Mat canvas(canvasSize, canvasSize, CV_8UC1, cv::Scalar(128));
+    const cv::Point middle(canvasSize / 2, canvasSize / 2);
+    const int boxHalf = static_cast<int>(90 / mmPerPixel);
+    cv::rectangle(canvas, middle - cv::Point(boxHalf, boxHalf), middle + cv::Point(boxHalf, boxHalf),
+                  cv::Scalar(0), static_cast<int>(2.5 / mmPerPixel));
+    if (drawCenter) drawRingTarget(canvas, middle, 50.0 / mmPerPixel);
+    for (int sy : {-1, 1}) {
+        for (int sx : {-1, 1}) {
+            drawRingTarget(canvas,
+                middle + cv::Point(static_cast<int>(sx * 90 / mmPerPixel),
+                                   static_cast<int>(sy * 90 / mmPerPixel)),
+                30.0 / mmPerPixel);
+        }
+    }
+    const cv::Matx33d canvasToMonitorMm(
+        mmPerPixel, 0, -canvasSize * mmPerPixel / 2,
+        0, mmPerPixel, -canvasSize * mmPerPixel / 2,
+        0, 0, 1);
+    const cv::Matx33d monitorToImage = cameraMatrix * cv::Matx33d(
+        rotation(0, 0), rotation(0, 1), 0,
+        rotation(1, 0), rotation(1, 1), 0,
+        rotation(2, 0), rotation(2, 1), distanceMm);
+    cv::Mat view;
+    cv::warpPerspective(canvas, view, cv::Mat(monitorToImage * canvasToMonitorMm),
+                        cv::Size(640, 480), cv::INTER_LINEAR, cv::BORDER_CONSTANT,
+                        cv::Scalar(128));
+    return view;
+}
+
+}  // namespace
+
+TEST(AlignmentDetectorTest, RejectsBlankAreaInsteadOfReadingAStep) {
+    int code = -1;
+    const cv::Mat white(480, 640, CV_8UC1, cv::Scalar(245));
+    EXPECT_FALSE(decodeAlignmentPhaseCode(white, cv::Point2f(0.5f, 0.3f), 0.1f, code));
+    const cv::Mat black(480, 640, CV_8UC1, cv::Scalar(10));
+    EXPECT_FALSE(decodeAlignmentPhaseCode(black, cv::Point2f(0.5f, 0.3f), 0.1f, code));
+}
+
+TEST(AlignmentDetectorTest, DoesNotReadStepsFromFringes) {
+    // Plain fringes at many positions and periods must never pass as step squares.
+    int falseReads = 0;
+    for (int period = 4; period <= 24; period += 2) {
+        for (int axis = 0; axis < 2; ++axis) {
+            cv::Mat frame(480, 640, CV_8UC1);
+            for (int y = 0; y < frame.rows; ++y) {
+                for (int x = 0; x < frame.cols; ++x) {
+                    frame.at<uint8_t>(y, x) = cv::saturate_cast<uint8_t>(
+                        128 + 100 * std::cos(2 * CV_PI * (axis ? y : x) / period));
+                }
+            }
+            for (float cy = 0.2f; cy < 0.8f; cy += 0.013f) {
+                for (float cx = 0.2f; cx < 0.8f; cx += 0.031f) {
+                    int code = -1;
+                    if (decodeAlignmentPhaseCode(frame, cv::Point2f(cx, cy), 0.1f, code)) ++falseReads;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(falseReads, 0);
+}
+
+TEST(AlignmentDetectorTest, IgnoresCornerMarkersWhenCenterIsHidden) {
+    const cv::Matx33d cameraMatrix(500, 0, 320, 0, 500, 240, 0, 0, 1);
+    const cv::Mat withCenter = renderMonitorView(cv::Matx33d::eye(), 500.0, cameraMatrix);
+    const cv::Mat cornersOnly = renderMonitorView(cv::Matx33d::eye(), 500.0, cameraMatrix, false);
+    cv::Point2f center;
+    float size = 0.0f;
+    int code = -1;
+    ASSERT_TRUE(detectAlignmentTarget(withCenter, center, size, code));
+    EXPECT_NEAR(center.x, 0.5f, 0.01f);
+    EXPECT_NEAR(center.y, 0.5f, 0.01f);
+    EXPECT_FALSE(detectAlignmentTarget(cornersOnly, center, size, code));
+}
+
+TEST(AlignmentDetectorTest, MeasuresMonitorTiltWithSign) {
+    const cv::Matx33d cameraMatrix(500, 0, 320, 0, 500, 240, 0, 0, 1);
+    const double angle = 10.0 * CV_PI / 180.0;
+    // Rotation about the vertical axis that pushes the monitor's right side away from the camera.
+    const cv::Matx33d rightSideFarther(
+        std::cos(angle), 0, -std::sin(angle),
+        0, 1, 0,
+        std::sin(angle), 0, std::cos(angle));
+    // Rotation about the horizontal axis that pulls the monitor's bottom toward the camera.
+    const cv::Matx33d bottomNearer(
+        1, 0, 0,
+        0, std::cos(angle), std::sin(angle),
+        0, -std::sin(angle), std::cos(angle));
+
+    float tiltRight = 0.0f;
+    float tiltDown = 0.0f;
+    float distance = 0.0f;
+    ASSERT_TRUE(estimateMonitorTilt(
+        renderMonitorView(cv::Matx33d::eye(), 500.0, cameraMatrix), cv::Point2f(0, 1),
+        cameraMatrix, 90.0f, tiltRight, tiltDown, distance));
+    EXPECT_NEAR(tiltRight, 0.0f, 1.5f);
+    EXPECT_NEAR(tiltDown, 0.0f, 1.5f);
+    EXPECT_NEAR(distance, 500.0f, 15.0f);
+    cv::Point2f corners[4];
+    ASSERT_TRUE(estimateMonitorTilt(
+        renderMonitorView(cv::Matx33d::eye(), 500.0, cameraMatrix), cv::Point2f(0, 1),
+        cameraMatrix, 90.0f, tiltRight, tiltDown, distance, corners));
+    // 90 mm at 500 mm with f = 500 px is 90 px from the principal point (320, 240).
+    EXPECT_NEAR(corners[0].x, 230.0f, 2.0f);  // top-left
+    EXPECT_NEAR(corners[0].y, 150.0f, 2.0f);
+    EXPECT_NEAR(corners[2].x, 410.0f, 2.0f);  // bottom-right
+    EXPECT_NEAR(corners[2].y, 330.0f, 2.0f);
+
+    ASSERT_TRUE(estimateMonitorTilt(
+        renderMonitorView(rightSideFarther, 500.0, cameraMatrix), cv::Point2f(0, 1),
+        cameraMatrix, 90.0f, tiltRight, tiltDown, distance));
+    EXPECT_NEAR(tiltRight, 10.0f, 1.5f);
+    EXPECT_NEAR(tiltDown, 0.0f, 1.5f);
+
+    ASSERT_TRUE(estimateMonitorTilt(
+        renderMonitorView(bottomNearer, 500.0, cameraMatrix), cv::Point2f(0, 1),
+        cameraMatrix, 90.0f, tiltRight, tiltDown, distance));
+    EXPECT_NEAR(tiltRight, 0.0f, 1.5f);
+    EXPECT_NEAR(tiltDown, -10.0f, 1.5f);
+
+    // Portrait phone: same scene, sensor image rotated relative to the monitor.
+    cv::Mat rotatedView;
+    cv::rotate(renderMonitorView(rightSideFarther, 500.0, cameraMatrix), rotatedView,
+               cv::ROTATE_90_CLOCKWISE);
+    const cv::Matx33d rotatedCamera(500, 0, 240, 0, 500, 320, 0, 0, 1);
+    ASSERT_TRUE(estimateMonitorTilt(
+        rotatedView, cv::Point2f(-1, 0), rotatedCamera, 90.0f, tiltRight, tiltDown, distance));
+    EXPECT_NEAR(tiltRight, 10.0f, 1.5f);
+    EXPECT_NEAR(tiltDown, 0.0f, 1.5f);
+}
+
+TEST(FrameStackTest, AveragesGoodFramesAndDropsOutliers) {
+    std::vector<cv::Mat> frames;
+    cv::RNG random(7);
+    for (int index = 0; index < 8; ++index) {
+        cv::Mat frame(60, 80, CV_8UC1);
+        random.fill(frame, cv::RNG::NORMAL, 120, 3);
+        frames.push_back(frame);
+    }
+    // A frame caught mid-redraw: half of it shows a different, much brighter pattern.
+    cv::Mat torn = frames.front().clone();
+    torn(cv::Rect(0, 0, 80, 30)).setTo(230);
+    frames.push_back(torn);
+
+    int kept = 0;
+    const cv::Mat combined = combineFrames(frames, kept);
+    EXPECT_EQ(kept, 8);
+    ASSERT_EQ(combined.type(), CV_32F);
+    EXPECT_NEAR(cv::mean(combined)[0], 120.0, 1.0);
+}
+
+namespace {
+
+// Ray-traces a 640×480 camera (f = 500 px) looking at a fringe screen 500 mm away through an
+// optional thin lens (power matrix in monitor axes x right / y down, dioptres) with a 4 mm rim,
+// and demodulates the four phase-shifted frames for one fringe axis.
+void renderLensView(const cv::Matx22d* power, double lensDistanceMm, int axis,
+                    cv::Mat& wrapped, cv::Mat& modulation, cv::Mat& brightness) {
+    constexpr int width = 640;
+    constexpr int height = 480;
+    constexpr double focal = 500.0;
+    constexpr double screenMm = 500.0;
+    constexpr double periodMm = 8.0;
+    constexpr double lensRadiusMm = 25.0;
+    constexpr double rimMm = 4.0;
+    cv::Mat frames[4];
+    for (auto& frame : frames) frame = cv::Mat(height, width, CV_32F);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const cv::Vec2d angle((x - width / 2.0) / focal, (y - height / 2.0) / focal);
+            cv::Vec2d screenPoint = angle * screenMm;
+            bool blocked = false;
+            if (power) {
+                const cv::Vec2d onLens = angle * lensDistanceMm;
+                const double radius = std::hypot(onLens[0], onLens[1]);
+                if (radius < lensRadiusMm) {
+                    const cv::Vec2d bent = angle - (*power) * (onLens / 1000.0);
+                    screenPoint = onLens + bent * (screenMm - lensDistanceMm);
+                } else if (radius < lensRadiusMm + rimMm) {
+                    blocked = true;
+                }
+            }
+            for (int step = 0; step < 4; ++step) {
+                // The rim is an opaque, dark frame.
+                frames[step].at<float>(y, x) = blocked ? 10.0f : static_cast<float>(
+                    128.0 + 100.0 * std::cos(2.0 * CV_PI * screenPoint[axis] / periodMm +
+                                             step * CV_PI / 2.0));
+            }
+        }
+    }
+    calculateWrappedPhase(frames[0], frames[1], frames[2], frames[3], wrapped, modulation);
+    brightness = (frames[0] + frames[1] + frames[2] + frames[3]) / 4.0;
+}
+
+// Power matrix for a prescription whose TABO axis is read from the front of the glasses,
+// as seen by the camera from behind and expressed in monitor axes (y down).
+cv::Matx22d powerMatrix(double sphere, double cylinder, double taboAxisDegrees) {
+    const double cameraAxis = (180.0 - taboAxisDegrees) * CV_PI / 180.0;
+    const cv::Vec2d across(-std::sin(cameraAxis), std::cos(cameraAxis));  // y up
+    cv::Matx22d upward = cv::Matx22d::eye() * sphere + (across * across.t()) * cylinder;
+    const cv::Matx22d flip(1, 0, 0, -1);
+    return flip * upward * flip;
+}
+
+LensMeasurement measureSynthetic(const cv::Matx22d& power) {
+    FringeRun reference;
+    FringeRun lens;
+    for (int axis = 0; axis < 2; ++axis) {
+        renderLensView(nullptr, 125.0, axis, reference.wrapped[axis], reference.modulation[axis],
+                       reference.brightness[axis]);
+        renderLensView(&power, 125.0, axis, lens.wrapped[axis], lens.modulation[axis],
+                       lens.brightness[axis]);
+    }
+    // The 50 mm lens held against the screen: radius 25 px, so sqrt(area) = 25·sqrt(pi).
+    const double screenOpening = 25.0 * std::sqrt(CV_PI);
+    return measureLensPower(reference, lens, cv::Point2f(0, 1), cv::Point2f(320, 240), 500.0,
+                            screenOpening);
+}
+
+}  // namespace
+
+TEST(LensMeasurementTest, MeasuresPlusLensAndItsDistance) {
+    const LensMeasurement result = measureSynthetic(powerMatrix(2.0, 0.0, 90.0));
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_NEAR(result.lensDistanceMm, 125.0, 4.0);
+    EXPECT_NEAR(result.sphere, 2.0, 0.1);
+    EXPECT_NEAR(result.cylinder, 0.0, 0.1);
+}
+
+TEST(LensMeasurementTest, MeasuresMinusLens) {
+    const LensMeasurement result = measureSynthetic(powerMatrix(-2.5, 0.0, 90.0));
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_NEAR(result.sphere, -2.5, 0.1);
+    EXPECT_NEAR(result.cylinder, 0.0, 0.1);
+}
+
+TEST(LensMeasurementTest, MeasuresAstigmatismAndAxis) {
+    const LensMeasurement result = measureSynthetic(powerMatrix(1.0, -1.5, 150.0));
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_NEAR(result.sphere, 1.0, 0.1);
+    EXPECT_NEAR(result.cylinder, -1.5, 0.1);
+    EXPECT_NEAR(result.axisDegrees, 150.0, 3.0);
+}
+
+TEST(LensMeasurementTest, FindsOutOfFocusRim) {
+    // The rim 12.5 cm from a camera focused at 50 cm is badly blurred; demodulate blurred
+    // frames so fringes only partly fade behind it.
+    const cv::Matx22d power = powerMatrix(2.0, 0.0, 90.0);
+    FringeRun reference;
+    FringeRun lens;
+    for (int axis = 0; axis < 2; ++axis) {
+        renderLensView(nullptr, 125.0, axis, reference.wrapped[axis], reference.modulation[axis],
+                       reference.brightness[axis]);
+        renderLensView(&power, 125.0, axis, lens.wrapped[axis], lens.modulation[axis],
+                       lens.brightness[axis]);
+        cv::GaussianBlur(lens.brightness[axis], lens.brightness[axis], cv::Size(0, 0), 4.0);
+    }
+    const LensMeasurement result = measureLensPower(
+        reference, lens, cv::Point2f(0, 1), cv::Point2f(320, 240), 500.0, 25.0 * std::sqrt(CV_PI));
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_NEAR(result.lensDistanceMm, 125.0, 8.0);
+    EXPECT_NEAR(result.sphere, 2.0, 0.15);
+}
+
+TEST(LensMeasurementTest, FindsLensOpeningAgainstScreen) {
+    cv::Mat frame(480, 640, CV_8UC1, cv::Scalar(30));                    // dark room
+    cv::rectangle(frame, cv::Rect(40, 20, 560, 440), cv::Scalar(235), cv::FILLED);  // screen
+    cv::circle(frame, cv::Point(320, 240), 60, cv::Scalar(20), 8);      // rim, inner r ≈ 56
+    cv::circle(frame, cv::Point(320, 240), 3, cv::Scalar(0), cv::FILLED);  // centering mark
+    double opening = 0.0;
+    ASSERT_TRUE(measureLensOpening(frame, cv::Point2f(320, 240), 20.0, opening));
+    EXPECT_NEAR(opening, 56.0 * std::sqrt(CV_PI), 5.0);
 }
 
 TEST(ZernikeFitterTest, FitsPureDefocus) {

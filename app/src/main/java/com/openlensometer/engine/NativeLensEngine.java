@@ -18,6 +18,34 @@ public class NativeLensEngine {
     public native int detectCharucoCorners(
             ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride);
 
+    public native float[] detectAlignmentTarget(
+            ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride,
+            float monitorDownX, float monitorDownY);
+
+    public native int decodeAlignmentPhaseCode(
+            ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride,
+            float normalizedCenterX, float normalizedCenterY, float normalizedTargetSize,
+            float monitorDownX, float monitorDownY);
+
+    /**
+     * Returns {tiltRightDeg, tiltDownDeg, distanceMm, then x,y image pixels of the corner markers
+     * top-left, top-right, bottom-right, bottom-left (NaN if missing)}, or null if fewer than
+     * three corner markers are seen.
+     */
+    public native float[] estimateMonitorTilt(
+            ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride,
+            float monitorDownX, float monitorDownY,
+            float focalX, float focalY, float principalX, float principalY,
+            float cornerOffsetMm);
+
+    /**
+     * Adds one exposure of the page being captured; capturePhaseFrame for the same axis/phase
+     * then averages them (dropping outliers). Returns the number collected so far, or < 0.
+     */
+    public native int addPhaseFrame(
+            ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride,
+            int axis, int phaseIndex);
+
     public native int capturePhaseFrame(
             ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride,
             ByteBuffer depthPlane, int depthWidth, int depthHeight,
@@ -27,7 +55,34 @@ public class NativeLensEngine {
 
     public native void resetPhaseCapture();
 
+    /** Forgets the stored no-lens reference run. */
+    public native void clearReferenceRun();
+
+    /**
+     * Keeps the finished run as the no-lens reference and clears capture for a lens run.
+     * Returns {X, Y} camera pixels per fringe period (-1 if unknown), or null if incomplete.
+     */
+    public native float[] saveReferenceRun(float monitorDownX, float monitorDownY);
+
+    /** Lens opening size (sqrt of area, pixels) with glasses flat on the screen, or -1. */
+    public native float measureLensOpening(
+            ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride,
+            float centerX, float centerY, float minSizePixels);
+
+    /**
+     * Compares the finished lens run with the reference. Returns {status, sphere, cylinder,
+     * axis, lensDistanceMm, lensOpeningPx, pixelsUsed, rmsResidualPx}. Status 0 = ok,
+     * 1 lens not found, 2 lens touches edge, 3 too few pixels, 4 fringes too fine,
+     * 5 bad input, 10 no reference, 11 lens run incomplete.
+     */
+    public native float[] measureLensFromRuns(
+            float monitorDownX, float monitorDownY, float lensCenterX, float lensCenterY,
+            float screenDistanceMm, float screenOpeningPixels, String debugPath);
+
     public native float[] getCapturedCameraDepthCalibration();
+
+        // [X mean modulation, Y mean modulation, depth p10, median, p90, valid sample count]
+        public native float[] getCaptureQualitySummary();
 
     /**
      * Calibrates the physical geometry of the screen using a ChArUco board.

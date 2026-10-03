@@ -33,6 +33,9 @@ if(ANDROID)
             lensometer_engine
             SHARED
             lensometer_engine.cpp
+            alignment_detector.cpp
+            frame_stack.cpp
+            lens_measurement.cpp
             aberration_removal.cpp
             depth16_filter.cpp
             phase_unwrapper.cpp
@@ -69,6 +72,9 @@ if(NOT ANDROID)
     add_executable(
         lensometer_tests
         test_lensometer.cpp
+        alignment_detector.cpp
+        frame_stack.cpp
+        lens_measurement.cpp
         zernike_fitter.cpp
         phase_unwrapper.cpp
         wavefront_calibrator.cpp 

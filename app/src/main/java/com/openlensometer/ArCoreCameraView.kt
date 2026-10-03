@@ -74,10 +74,11 @@ class ArCoreCameraView(context: Context, attrs: AttributeSet? = null) :
             -1f, -1f, 1f, -1f,
             -1f, 1f, 1f, 1f
         )
-        val textureCoordinates = FloatBuffer.allocate(8)
+        val textureCoordinates = floatBufferOf(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
+        vertices.position(0)
         frame.transformCoordinates2d(
             Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
-            vertices.duplicate(),
+            vertices,
             Coordinates2d.TEXTURE_NORMALIZED,
             textureCoordinates
         )
