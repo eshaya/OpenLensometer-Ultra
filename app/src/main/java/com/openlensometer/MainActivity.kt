@@ -7,6 +7,7 @@ import android.media.Image
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
@@ -32,13 +33,19 @@ import com.openlensometer.engine.NativeLensEngine
 import com.openlensometer.engine.EyePrescription
 import com.openlensometer.engine.ReferenceGlasses
 import com.openlensometer.engine.ReferenceGlassesStore
+import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.ceil
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sign
 
@@ -50,7 +57,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var statusView: TextView
     private lateinit var detectionView: TextView
     private lateinit var captureButton: Button
-    private lateinit var cancelPhaseButton: Button
     private lateinit var referenceView: TextView
     private val referenceGlassesStore by lazy { ReferenceGlassesStore(this) }
     private val nativeEngine by lazy { NativeLensEngine() }
@@ -61,18 +67,38 @@ class MainActivity : ComponentActivity() {
     /** Reference run (no lens) → lens size (glasses on the screen) → lens run. */
     private enum class Stage { REFERENCE, LENS_SIZE, LENS }
     @Volatile private var stage = Stage.REFERENCE
-    /** The wearer's left lens is measured first, then the right. */
-    private enum class Eye(val label: String, val code: String) { LEFT("LEFT", "OS"), RIGHT("RIGHT", "OD") }
-    @Volatile private var currentEye = Eye.LEFT
-    /** Finished prescriptions: {sphere, cylinder, axis}. */
-    private val eyeResults = mutableMapOf<Eye, FloatArray>()
-    @Volatile private var lensSizeRequested = false
     private val lensOpeningSamples = ArrayDeque<Float>()
-    private var lastDiagnosticFrameMs = 0L
+    @Volatile private var lastDiagnosticFrameMs = 0L
+    private var lastUnreadableSaveMs = 0L
+    /** Correction to ARCore's focal length from the one-time ruler calibration (kept). */
+    @Volatile private var distanceScale = 1f
+    @Volatile private var lastUncalibratedDistanceMm = 0f
+    private var lastLensSizeSaveMs = 0L
+    private val gridWorker = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val gridWorkerBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+    private var gridFrameCopy: ByteBuffer? = null
+    @Volatile private var lastGridStatus = -1
+    @Volatile private var sawLensSizeScreen = false
+    @Volatile private var lastFocalPixels = 500f
+    @Volatile private var gridReferenceFrames = 0
+    private val gridResults = ArrayDeque<Pair<Long, FloatArray>>()
+    private var savedGridFrames = 0
+    /** A grid result is on screen; it stays until a new grid appears. */
+    @Volatile private var gridShowingResult = false
+    /** The grid that produced the result is still up; don't measure it again. */
+    @Volatile private var gridWaitingForNewGrid = false
+    /** Page code last seen in the lens stage, to notice the white screen appearing anew. */
+    @Volatile private var lensStagePreviousCode = -1
+    private val gridStatusCounts = sortedMapOf<Int, Int>()
+    private var lastGridLogMs = 0L
+    private var lastRemoteSpot = 0
     private var previousThumbnail: ByteArray? = null
     private var lastRawCode = Int.MIN_VALUE
     private var framesSincePageChange = 0
     @Volatile private var steadyFrames = 0
+    private var lastMotion = 0f
+    private val motionSamples = ArrayList<Float>()
+    private var lastMotionLogMs = 0L
     @Volatile private var imageWidth = 0
     @Volatile private var imageHeight = 0
     @Volatile private var lastMonitorDown = floatArrayOf(0f, 1f)
@@ -80,12 +106,8 @@ class MainActivity : ComponentActivity() {
     private var screenDistanceMm = 0
     /** Lens opening (sqrt of area, image pixels) with the glasses held on the screen. */
     private var screenOpeningPixels = 0f
-    private lateinit var measureSizeButton: Button
-    private lateinit var repeatLensButton: Button
     /** Frames of the current page handed to native code so far (averaged at commit). */
     @Volatile private var collectedFrames = 0
-    /** Set by "Cancel" so the phone doesn't immediately re-arm itself. */
-    @Volatile private var autoArmPaused = false
     private val alignmentSamples = ArrayDeque<AlignmentSample>()
     private var lastAlignmentUiMs = 0L
     private var lastPublishedAlignmentReady: Boolean? = null
@@ -116,6 +138,9 @@ class MainActivity : ComponentActivity() {
             setTextColor(android.graphics.Color.BLACK)
             setBackgroundColor(android.graphics.Color.rgb(255, 210, 0))
             setPadding(16, 10, 16, 10)
+            // Fixed heights so changing messages don't make the camera picture jump.
+            setLines(3)
+            ellipsize = android.text.TextUtils.TruncateAt.END
         }
         statusView = TextView(this).apply {
             text = capturePrompt()
@@ -123,6 +148,8 @@ class MainActivity : ComponentActivity() {
             setTextColor(android.graphics.Color.BLACK)
             setBackgroundColor(android.graphics.Color.rgb(255, 238, 150))
             setPadding(16, 6, 16, 2)
+            setLines(1)
+            ellipsize = android.text.TextUtils.TruncateAt.END
         }
         detectionView = TextView(this).apply {
             text = "PHONE: Waiting for camera"
@@ -130,14 +157,11 @@ class MainActivity : ComponentActivity() {
             setTextColor(android.graphics.Color.BLACK)
             setBackgroundColor(android.graphics.Color.rgb(255, 238, 150))
             setPadding(16, 2, 16, 6)
+            setLines(2)
+            ellipsize = android.text.TextUtils.TruncateAt.END
         }
         captureButton = Button(this).apply {
             setOnClickListener { requestPhaseCapture() }
-        }
-        cancelPhaseButton = Button(this).apply {
-            text = "Cancel prepared capture"
-            visibility = ViewGroup.GONE
-            setOnClickListener { cancelPhaseWait() }
         }
         referenceView = TextView(this).apply {
             textSize = 12f
@@ -146,19 +170,6 @@ class MainActivity : ComponentActivity() {
         val referenceButton = Button(this).apply {
             text = "Reference glasses"
             setOnClickListener { showReferenceGlassesDialog() }
-        }
-        measureSizeButton = Button(this).apply {
-            text = "Measure lens size now (it also measures by itself)"
-            visibility = ViewGroup.GONE
-            setOnClickListener {
-                lensSizeRequested = true
-                actionView.text = "NOW: Hold the glasses still on the screen…"
-            }
-        }
-        repeatLensButton = Button(this).apply {
-            text = "Repeat lens run"
-            visibility = ViewGroup.GONE
-            setOnClickListener { startLensRun() }
         }
         val resetButton = Button(this).apply {
             text = "Reset capture"
@@ -199,16 +210,19 @@ class MainActivity : ComponentActivity() {
                 addView(captureButton, sideBySide())
                 addView(resetButton, sideBySide())
                 addView(referenceButton, sideBySide())
+                addView(Button(this@MainActivity).apply {
+                    text = "Calibrate distance"
+                    setOnClickListener { showDistanceCalibrationDialog() }
+                }, sideBySide())
             }, fullWidth())
-            addView(cancelPhaseButton, fullWidth())
-            addView(measureSizeButton, fullWidth())
-            addView(repeatLensButton, fullWidth())
             addView(referenceView, fullWidth())
         })
         updateReferenceView()
 
         nativeEngine.resetPhaseCapture()
         discardSavedMeasurement()
+        // The distance calibration belongs to the phone, not the session, so it is kept.
+        distanceScale = getSharedPreferences("calibration", MODE_PRIVATE).getFloat("distanceScale", 1f)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -309,6 +323,15 @@ class MainActivity : ComponentActivity() {
                 processLensSizeFrame(cameraImage, monitorDown)
                 return
             }
+            // A result is on screen: stay idle until a key on the computer changes the page
+            // (G: grid again, L: white screen for another lens). Only the page is checked.
+            if (stage == Stage.LENS && gridShowingResult) {
+                val target = lastAlignmentTarget ?: return
+                val code = decodeRemoteSquares(cameraImage, target, monitorDown)
+                if (code >= 0 && code != GRID_CODE) gridWaitingForNewGrid = false
+                val newGrid = code == GRID_CODE && !gridWaitingForNewGrid
+                if (!newGrid && code != LENS_SIZE_SCREEN_CODE) return
+            }
             // In the lens run the camera looks through the glasses, so the bullseye can't be
             // trusted; the tripod hasn't moved since the reference run, so reuse its position.
             val lensRun = stage == Stage.LENS
@@ -342,8 +365,8 @@ class MainActivity : ComponentActivity() {
                         // The camera must not move now, so no aiming advice; save a picture
                         // (at most every few seconds) to see what hides the squares.
                         val now = System.currentTimeMillis()
-                        if (now - lastDiagnosticFrameMs > DIAGNOSTIC_FRAME_INTERVAL_MS) {
-                            lastDiagnosticFrameMs = now
+                        if (now - lastUnreadableSaveMs > UNREADABLE_SAVE_INTERVAL_MS) {
+                            lastUnreadableSaveMs = now
                             saveGrayscaleFrame(cameraImage, "lens-run-unreadable.pgm")
                         }
                         if (setupMovedSinceReference(cameraImage, monitorDown, previousTarget)) {
@@ -359,7 +382,7 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                     } else {
-                        handleAlignmentMiss("Can't read the step squares above the screen center")
+                        handleAlignmentMiss("Can't read the step squares around the screen center")
                     }
                     return
                 }
@@ -395,13 +418,43 @@ class MainActivity : ComponentActivity() {
             val (detectedPhaseCode, stableBullseyeVisible) =
                 debounceScreenState(target[3].toInt(), bullseyeVisible)
             // Once lined up, get ready for the next step without waiting for a tap.
-            if (pendingCapture.get() == null && guide.first && !captureComplete &&
-                !autoArmPaused
-            ) {
+            if (pendingCapture.get() == null && guide.first && !captureComplete) {
                 if (pendingCapture.compareAndSet(
                         null, ArmedCapture(CaptureRequest(captureAxis, capturePhase))
                     )
                 ) runOnUiThread { updateCaptureButton() }
+            }
+            // The white screen (L) during the lens stage: measure the lens size again, e.g. for
+            // different glasses; the reference run is kept.
+            // Only when the white screen newly appears: it is often still up for a few seconds
+            // after the size has just been taken.
+            val whiteScreenAppeared = detectedPhaseCode == LENS_SIZE_SCREEN_CODE &&
+                lensStagePreviousCode != LENS_SIZE_SCREEN_CODE
+            // Ignore unreadable moments (e.g. right after the lens run resets its page tracking),
+            // or a still-showing white screen would look newly appeared.
+            if (lensRun && detectedPhaseCode >= 0) lensStagePreviousCode = detectedPhaseCode
+            if (lensRun && whiteScreenAppeared) {
+                stage = Stage.LENS_SIZE
+                gridShowingResult = false
+                gridWaitingForNewGrid = false
+                lensOpeningSamples.clear()
+                return
+            }
+            // A grid result stays on screen until the next grid (G) starts a new measurement.
+            if (lensRun && gridShowingResult && detectedPhaseCode != GRID_CODE) {
+                gridWaitingForNewGrid = false
+                return
+            }
+            if (detectedPhaseCode == GRID_CODE) {
+                if (lensRun) {
+                    processGridLensFrame(frame, cameraImage, monitorDown)
+                } else if (stage == Stage.REFERENCE) {
+                    collectGridReference(
+                        cameraImage, guide,
+                        target[3].toInt() == GRID_CODE && !bullseyeVisible
+                    )
+                }
+                return
             }
             val armedCapture = pendingCapture.get()
             if (armedCapture == null) {
@@ -428,7 +481,7 @@ class MainActivity : ComponentActivity() {
                 val intrinsics = frame.camera.imageIntrinsics
                 val focalLength = FloatArray(2)
                 val principalPoint = FloatArray(2)
-                intrinsics.getFocalLength(focalLength, 0)
+                calibratedFocalLength(frame, focalLength)
                 intrinsics.getPrincipalPoint(principalPoint, 0)
                 val depthPlane = depthImage.planes[0]
                 // Native code averages the frames collected with addPhaseFrame.
@@ -505,9 +558,11 @@ class MainActivity : ComponentActivity() {
                 )
                 if (count > 0) collectedFrames = count
             }
-            if (collectedFrames < FRAMES_PER_PAGE) {
+            // Static reference: many frames per page. Hand-held lens: a few, on fast pages.
+            val framesWanted = if (lensRun) LENS_FRAMES_PER_PAGE else FRAMES_PER_PAGE
+            if (collectedFrames < framesWanted) {
                 publishAlignment(
-                    true, "Hold still · photographing step $step/8 ($collectedFrames/$FRAMES_PER_PAGE)",
+                    true, "Hold still · photographing step $step/8 ($collectedFrames/$framesWanted)",
                     "No key. Collecting frames of step $step/8",
                     "HOLD STILL. DON'T PRESS ANY KEY. Photographing step $step/8"
                 )
@@ -548,21 +603,36 @@ class MainActivity : ComponentActivity() {
         return shift > SETUP_MOVED_FRACTION * reference.size * cameraImage.height
     }
 
-    /** Reads the step squares drawn ~10 cm above center (native code searches around it). */
+    /**
+     * Reads one of the copies of the step squares drawn around the center (above, below, left,
+     * right), trying the one that worked last time first: the hands holding the glasses can
+     * hide some of them. Native code searches a little around each.
+     */
     private fun decodeRemoteSquares(
         cameraImage: Image,
         target: AlignmentTarget,
         monitorDown: FloatArray
     ): Int {
         val yPlane = cameraImage.planes[0]
-        val alongDown = REMOTE_TICKS_OFFSET_MM / BULLSEYE_DIAMETER_MM * target.size * cameraImage.height
-        return nativeEngine.decodeAlignmentPhaseCode(
-            yPlane.buffer.slice(), cameraImage.width, cameraImage.height,
-            yPlane.rowStride, yPlane.pixelStride,
-            target.centerX + monitorDown[0] * alongDown / cameraImage.width,
-            target.centerY + monitorDown[1] * alongDown / cameraImage.height,
-            target.size, monitorDown[0], monitorDown[1]
-        )
+        val pixelsPerMm = target.size * cameraImage.height / BULLSEYE_DIAMETER_MM
+        val rightX = monitorDown[1]
+        val rightY = -monitorDown[0]
+        val order = listOf(lastRemoteSpot) + REMOTE_TICK_SPOTS_MM.indices.filter { it != lastRemoteSpot }
+        for (spot in order) {
+            val (rightMm, downMm) = REMOTE_TICK_SPOTS_MM[spot]
+            val code = nativeEngine.decodeAlignmentPhaseCode(
+                yPlane.buffer.slice(), cameraImage.width, cameraImage.height,
+                yPlane.rowStride, yPlane.pixelStride,
+                target.centerX + (rightX * rightMm + monitorDown[0] * downMm) * pixelsPerMm / cameraImage.width,
+                target.centerY + (rightY * rightMm + monitorDown[1] * downMm) * pixelsPerMm / cameraImage.height,
+                target.size, monitorDown[0], monitorDown[1]
+            )
+            if (code >= 0) {
+                lastRemoteSpot = spot
+                return code
+            }
+        }
+        return -1
     }
 
     /**
@@ -590,7 +660,7 @@ class MainActivity : ComponentActivity() {
         val tilt = if (bullseyeVisible) {
             val focal = FloatArray(2)
             val principal = FloatArray(2)
-            frame.camera.imageIntrinsics.getFocalLength(focal, 0)
+            calibratedFocalLength(frame, focal)
             frame.camera.imageIntrinsics.getPrincipalPoint(principal, 0)
             nativeEngine.estimateMonitorTilt(
                 yPlane.buffer.slice(), cameraImage.width, cameraImage.height,
@@ -613,7 +683,22 @@ class MainActivity : ComponentActivity() {
 
         val guide = evaluateAlignment(sample)
         alignmentReady = guide.first
-        updateOverlay(frame, tilt, guide.first)
+        val (tiltRight, tiltDown) = averagedTilts()
+        fun tiltReading(label: String, value: Double?) = AlignmentOverlayView.Reading(
+            label, value?.let { String.format(Locale.US, "%+.1f°", it) } ?: "–",
+            value != null && abs(value) <= MAX_TILT_DEG
+        )
+        updateOverlay(
+            frame, tilt, guide.first,
+            listOf(
+                tiltReading("Tilt L/R", tiltRight),
+                tiltReading("Tilt F/B", tiltDown),
+                AlignmentOverlayView.Reading(
+                    "Distance", "${distanceMm / 10} cm",
+                    distanceMm in MIN_WORKING_DISTANCE_MM..MAX_WORKING_DISTANCE_MM
+                )
+            )
+        )
         return guide
     }
 
@@ -622,47 +707,27 @@ class MainActivity : ComponentActivity() {
      * monitor first (tilt shifts the target), then slide it to center, then set distance.
      * All directions are as the user sees the phone screen while the camera faces the monitor.
      */
+    /** Tilt to the left/right and forward/back, averaged over recent frames (null = unknown). */
+    private fun averagedTilts(): Pair<Double?, Double?> {
+        fun average(values: List<Float>) = values.takeIf { it.size >= MIN_TILT_SAMPLES }?.average()
+        return average(alignmentSamples.mapNotNull { it.tiltRightDeg }) to
+            average(alignmentSamples.mapNotNull { it.tiltDownDeg })
+    }
+
+    /**
+     * Whether the phone is lined up. The how-to is shown graphically (box colour, tilt and
+     * distance readings, pink box), so the messages only say what state it is in.
+     */
     private fun evaluateAlignment(sample: AlignmentSample): Pair<Boolean, String> {
-        val tiltRight = alignmentSamples.mapNotNull { it.tiltRightDeg }
-            .takeIf { it.size >= MIN_TILT_SAMPLES }?.average()
-        val tiltDown = alignmentSamples.mapNotNull { it.tiltDownDeg }
-            .takeIf { it.size >= MIN_TILT_SAMPLES }?.average()
-        val worstTilt = listOfNotNull(
-            tiltRight?.let { "RIGHT" to it }, tiltRight?.let { "LEFT" to -it },
-            tiltDown?.let { "BOTTOM" to it }, tiltDown?.let { "TOP" to -it }
-        ).maxByOrNull { it.second }
-        if (worstTilt != null && worstTilt.second > MAX_TILT_DEG) {
-            return false to "TILT: turn the phone so its ${worstTilt.first} edge moves " +
-                "toward the monitor (~${worstTilt.second.roundToInt()}°). The pink box's " +
-                "${worstTilt.first.lowercase()} side looks shorter"
+        val (tiltRight, tiltDown) = averagedTilts()
+        val tilted = listOfNotNull(tiltRight, tiltDown).any { abs(it) > MAX_TILT_DEG }
+        val offCenter = sample.viewX !in CENTER_MIN..CENTER_MAX ||
+            sample.viewY !in CENTER_MIN..CENTER_MAX
+        val wrongDistance = sample.depthMm !in MIN_WORKING_DISTANCE_MM..MAX_WORKING_DISTANCE_MM
+        if (tilted || offCenter || wrongDistance) {
+            return false to "Line up until the box turns green"
         }
-
-        val moves = mutableListOf<String>()
-        if (sample.viewX < CENTER_MIN || sample.viewX > CENTER_MAX) {
-            moves += "${if (sample.offsetRightMm < 0f) "LEFT" else "RIGHT"} ${centimeters(sample.offsetRightMm)}"
-        }
-        if (sample.viewY < CENTER_MIN || sample.viewY > CENTER_MAX) {
-            moves += "${if (sample.offsetDownMm < 0f) "UP" else "DOWN"} ${centimeters(sample.offsetDownMm)}"
-        }
-        if (moves.isNotEmpty()) {
-            return false to "MOVE the whole phone ${moves.joinToString(" and ")} " +
-                "(slide it; don't tilt) until the pink box sits on the white box"
-        }
-
-        if (sample.depthMm > MAX_WORKING_DISTANCE_MM) {
-            return false to "MOVE FORWARD: bring the phone ${centimeters(
-                (sample.depthMm - TARGET_WORKING_DISTANCE_MM).toFloat()
-            )} closer to the monitor (now ${sample.depthMm / 10} cm; pink box is smaller than white)"
-        }
-        if (sample.depthMm < MIN_WORKING_DISTANCE_MM) {
-            return false to "MOVE BACK: pull the phone ${centimeters(
-                (TARGET_WORKING_DISTANCE_MM - sample.depthMm).toFloat()
-            )} away from the monitor (now ${sample.depthMm / 10} cm; pink box is bigger than white)"
-        }
-        if (alignmentSamples.size < STABLE_FRAME_COUNT) {
-            return false to "Lined up at ${sample.depthMm / 10} cm. Hold still " +
-                "(${alignmentSamples.size}/$STABLE_FRAME_COUNT)"
-        }
+        if (alignmentSamples.size < STABLE_FRAME_COUNT) return false to "Hold still"
 
         val samples = alignmentSamples.toList()
         val centerXRange = samples.maxOf { it.viewX } - samples.minOf { it.viewX }
@@ -671,8 +736,8 @@ class MainActivity : ComponentActivity() {
         val sizeRange = samples.maxOf { it.targetSize } - samples.minOf { it.targetSize }
         if (centerXRange > MAX_CENTER_JITTER || centerYRange > MAX_CENTER_JITTER ||
             depthRange > MAX_DEPTH_JITTER_MM || sizeRange > MAX_SIZE_JITTER
-        ) return false to "Lined up. Hold the phone steadier"
-        return true to "Lined up and steady at ${sample.depthMm / 10} cm. Don't move"
+        ) return false to "Hold still"
+        return true to "Lined up. Don't move the phone"
     }
 
     /**
@@ -707,6 +772,8 @@ class MainActivity : ComponentActivity() {
         return when {
             detectedCode == LENS_SIZE_SCREEN_CODE -> "PRESS R now (leaves the white screen)" to
                 "The white lens-size screen is showing"
+            detectedCode == LOOP_COUNTDOWN_CODE -> "WAIT. The pages start by themselves" to
+                "Countdown running"
             detectedCode == 0 && step == 1 -> "PRESS RETURN now to start" to
                 "Starts the 8 pages; auto-advance runs them all"
             detectedCode == 0 -> "PRESS RETURN now to redo step $step/8$kept" to
@@ -737,10 +804,12 @@ class MainActivity : ComponentActivity() {
     private fun lensRunInstruction(detectedCode: Int, expectedCode: Int): Pair<String, String>? {
         val step = expectedCode - 7
         return when {
-            detectedCode == LENS_SIZE_SCREEN_CODE -> "PRESS R to start the lens loop" to
-                "R starts the repeating pages after a 5-second countdown"
-            detectedCode == 0 -> "Get ready: hold the glasses steady with both hands. The " +
-                "pages start by themselves" to "No key. Countdown running"
+            detectedCode == LENS_SIZE_SCREEN_CODE -> "Get ready: the lens run starts by itself " +
+                "when the white screen ends" to "No key needed"
+            detectedCode == LOOP_COUNTDOWN_CODE -> "Get ready: hold the glasses steady with " +
+                "both hands. The pages start by themselves" to "No key. Countdown running"
+            detectedCode == 0 -> "Time ran out. PRESS G to measure again (L redoes the lens " +
+                "size)" to "G shows the grid for another 20 s"
             detectedCode !in 8..15 -> "Can't tell which page the monitor shows. PRESS R to " +
                 "start the lens loop. Don't move the phone" to "Can't read the step squares"
             detectedCode == expectedCode -> null
@@ -762,14 +831,19 @@ class MainActivity : ComponentActivity() {
         rawCode: Int
     ): Boolean {
         val buffer = plane.buffer
-        val columns = width / MOTION_SAMPLE_STEP
-        val rows = height / MOTION_SAMPLE_STEP
+        // Only the middle of the picture, where the lens is: hands and arms moving at the
+        // edges don't disturb the measurement.
+        val left = (width * (1f - MOTION_REGION) / 2f).toInt()
+        val top = (height * (1f - MOTION_REGION) / 2f).toInt()
+        val columns = (width * MOTION_REGION).toInt() / MOTION_SAMPLE_STEP
+        val rows = (height * MOTION_REGION).toInt() / MOTION_SAMPLE_STEP
         val thumbnail = ByteArray(columns * rows)
         for (row in 0 until rows) {
-            val rowStart = row * MOTION_SAMPLE_STEP * plane.rowStride
+            val rowStart = (top + row * MOTION_SAMPLE_STEP) * plane.rowStride
             for (column in 0 until columns) {
-                thumbnail[row * columns + column] =
-                    buffer.get(rowStart + column * MOTION_SAMPLE_STEP * plane.pixelStride)
+                thumbnail[row * columns + column] = buffer.get(
+                    rowStart + (left + column * MOTION_SAMPLE_STEP) * plane.pixelStride
+                )
             }
         }
         val previous = previousThumbnail
@@ -790,6 +864,17 @@ class MainActivity : ComponentActivity() {
             total += abs((thumbnail[index].toInt() and 0xff) - (previous[index].toInt() and 0xff))
         }
         val motion = total.toFloat() / thumbnail.size
+        lastMotion = motion
+        motionSamples += motion
+        val now = System.currentTimeMillis()
+        if (now - lastMotionLogMs >= 1000L && motionSamples.isNotEmpty()) {
+            val sorted = motionSamples.sorted()
+            Log.d(LOG_TAG, "lens run motion: median ${"%.1f".format(sorted[sorted.size / 2])}, " +
+                "max ${"%.1f".format(sorted.last())} over ${sorted.size} frames " +
+                "(limit $MOTION_LIMIT), steady frames $steadyFrames")
+            motionSamples.clear()
+            lastMotionLogMs = now
+        }
         return if (motion > MOTION_LIMIT) {
             steadyFrames = 0
             true
@@ -807,7 +892,8 @@ class MainActivity : ComponentActivity() {
         collectedFrames = 0
         steadyFrames = 0
         pendingCapture.set(ArmedCapture(CaptureRequest(AXIS_X, 0)))
-        Log.d(LOG_TAG, "lens attempt restarted: $reason")
+        Log.d(LOG_TAG, "lens attempt restarted: $reason (motion ${"%.1f".format(lastMotion)}, " +
+            "limit $MOTION_LIMIT)")
         runOnUiThread {
             actionView.text = "NOW: $reason. HOLD STEADY · starting over when step 1 comes round"
             updateCaptureButton()
@@ -834,9 +920,6 @@ class MainActivity : ComponentActivity() {
 
     private fun times(count: Int): String = if (count > 1) " $count times" else ""
 
-    private fun centimeters(mm: Float): String =
-        "${max(1, (abs(mm) / 10f).roundToInt())} cm"
-
     private fun handleAlignmentMiss(message: String, resetImmediately: Boolean = false) {
         consecutiveAlignmentMisses++
         if (resetImmediately || consecutiveAlignmentMisses > MAX_ALIGNMENT_MISSES) {
@@ -844,7 +927,9 @@ class MainActivity : ComponentActivity() {
             alignmentReady = false
         }
         val displayedMessage = if (alignmentReady) "Bullseye briefly lost. Hold steady" else message
-        lastOverlayTarget?.let { overlayView.update(AlignmentOverlayView.State(it, null, false)) }
+        lastOverlayTarget?.let {
+            overlayView.update(AlignmentOverlayView.State(it, null, false, emptyList()))
+        }
         // Also overwrite the KEYBOARD line so an old "press RETURN" can't linger on screen.
         publishAlignment(
             alignmentReady, displayedMessage,
@@ -897,7 +982,7 @@ class MainActivity : ComponentActivity() {
         val intrinsics = frame.camera.imageIntrinsics
         val focal = FloatArray(2)
         val principal = FloatArray(2)
-        intrinsics.getFocalLength(focal, 0)
+        calibratedFocalLength(frame, focal)
         intrinsics.getPrincipalPoint(principal, 0)
 
         fun viewToImage(viewX: Float, viewY: Float) = transformPoint(
@@ -932,10 +1017,15 @@ class MainActivity : ComponentActivity() {
      * CORNER_MARKER_OFFSET_MM apart) appears from TARGET_WORKING_DISTANCE_MM, centered on the
      * preview, and the pink box where the camera actually sees the corner markers.
      */
-    private fun updateOverlay(frame: Frame, tilt: FloatArray?, aligned: Boolean) {
+    private fun updateOverlay(
+        frame: Frame,
+        tilt: FloatArray?,
+        aligned: Boolean,
+        readings: List<AlignmentOverlayView.Reading>
+    ) {
         val focal = FloatArray(2)
         val principal = FloatArray(2)
-        frame.camera.imageIntrinsics.getFocalLength(focal, 0)
+        calibratedFocalLength(frame, focal)
         frame.camera.imageIntrinsics.getPrincipalPoint(principal, 0)
         val sideImagePixels = (focal[0] + focal[1]) / 2f *
             (2f * CORNER_MARKER_OFFSET_MM) / TARGET_WORKING_DISTANCE_MM
@@ -973,17 +1063,90 @@ class MainActivity : ComponentActivity() {
         } else {
             null
         }
-        overlayView.update(AlignmentOverlayView.State(target, corners, aligned))
+        overlayView.update(AlignmentOverlayView.State(target, corners, aligned, readings))
     }
 
     /** Pinhole distance to the monitor: focal length × real bullseye size ÷ imaged size. */
     private fun distanceFromBullseye(frame: Frame, bullseyeImagePixels: Float): Int {
         if (!bullseyeImagePixels.isFinite() || bullseyeImagePixels <= 1f) return -1
         val focal = FloatArray(2)
-        frame.camera.imageIntrinsics.getFocalLength(focal, 0)
+        calibratedFocalLength(frame, focal)
         val focalPixels = (focal[0] + focal[1]) / 2f
         if (!focalPixels.isFinite() || focalPixels <= 0f) return -1
-        return (focalPixels * BULLSEYE_DIAMETER_MM / bullseyeImagePixels).roundToInt()
+        val distance = focalPixels * BULLSEYE_DIAMETER_MM / bullseyeImagePixels
+        lastUncalibratedDistanceMm = distance / distanceScale
+        return distance.roundToInt()
+    }
+
+    /**
+     * ARCore's focal length, corrected by the one-time distance calibration. On the Pixel 7a
+     * ARCore's value was ~10% low, which made every distance and so every power ~11% off.
+     */
+    private fun calibratedFocalLength(frame: Frame, out: FloatArray) {
+        frame.camera.imageIntrinsics.getFocalLength(out, 0)
+        out[0] *= distanceScale
+        out[1] *= distanceScale
+    }
+
+    /** One-time setup: the ruler-measured camera-to-screen distance fixes the focal length. */
+    private fun showDistanceCalibrationDialog() {
+        val estimate = lastUncalibratedDistanceMm
+        if (estimate <= 0f) {
+            Toast.makeText(this, "Line the phone up on the bullseye first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 8, 24, 8)
+        }
+        form.addView(TextView(this).apply {
+            text = String.format(
+                Locale.US,
+                "Phone's estimate: %.1f cm (calibrated: %.1f cm). Measure from the camera lens " +
+                    "to the monitor screen with a ruler and enter it:",
+                estimate / 10f, estimate * distanceScale / 10f
+            )
+        })
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "e.g. 21"
+        }
+        form.addView(input)
+        val units = android.widget.RadioGroup(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val inches = android.widget.RadioButton(this).apply { text = "inches"; id = View.generateViewId() }
+        val centimetres = android.widget.RadioButton(this).apply { text = "cm"; id = View.generateViewId() }
+        units.addView(inches)
+        units.addView(centimetres)
+        units.check(inches.id)
+        form.addView(units)
+        AlertDialog.Builder(this)
+            .setTitle("Calibrate distance")
+            .setView(form)
+            .setPositiveButton("Save") { _, _ ->
+                val value = input.text.toString().toFloatOrNull()
+                if (value == null || value <= 0f) {
+                    Toast.makeText(this, "Enter the measured distance", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                val measuredMm = if (units.checkedRadioButtonId == inches.id) value * 25.4f else value * 10f
+                val newScale = measuredMm / estimate
+                if (newScale !in 0.5f..2f) {
+                    Toast.makeText(this, "That is very different from the estimate; not saved", Toast.LENGTH_LONG).show()
+                    return@setPositiveButton
+                }
+                if (screenDistanceMm > 0) {
+                    screenDistanceMm = (screenDistanceMm * newScale / distanceScale).roundToInt()
+                }
+                distanceScale = newScale
+                getSharedPreferences("calibration", MODE_PRIVATE).edit()
+                    .putFloat("distanceScale", newScale).apply()
+                Log.d(LOG_TAG, "distance calibration: scale $newScale")
+                Toast.makeText(
+                    this, String.format(Locale.US, "Saved: distances now ×%.3f", newScale), Toast.LENGTH_LONG
+                ).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun transformPoint(
@@ -1145,22 +1308,12 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (captureComplete || pendingCapture.get() != null) return
-        autoArmPaused = false
         val armed = ArmedCapture(CaptureRequest(captureAxis, capturePhase))
         if (!pendingCapture.compareAndSet(null, armed)) return
 
         actionView.text = "NOW: DON'T PRESS ANY KEY. Reading which page the monitor shows…"
         statusView.text = "KEYBOARD: Reading which step the monitor shows…"
         detectionView.text = "PHONE: Keep the bullseye and the squares under it in view"
-        updateCaptureButton()
-    }
-
-    private fun cancelPhaseWait() {
-        autoArmPaused = true
-        pendingCapture.set(null)
-        actionView.text = "NOW: Line up the phone, then tap Prepare. Don't press any key"
-        statusView.text = "KEYBOARD: No key needed. Capture paused"
-        detectionView.text = "PHONE: Line up again, then tap Prepare to continue"
         updateCaptureButton()
     }
 
@@ -1219,11 +1372,12 @@ class MainActivity : ComponentActivity() {
         capturePhase = 0
         captureComplete = false
         collectedFrames = 0
-        autoArmPaused = false
         stage = Stage.REFERENCE
-        currentEye = Eye.LEFT
-        eyeResults.clear()
-        lensSizeRequested = false
+        gridReferenceFrames = 0
+        gridResults.clear()
+        gridShowingResult = false
+        gridWaitingForNewGrid = false
+        sawLensSizeScreen = false
         screenOpeningPixels = 0f
         nativeEngine.clearReferenceRun()
         actionView.text = "NOW: DON'T PRESS ANY KEY. Line up on the bullseye"
@@ -1238,36 +1392,248 @@ class MainActivity : ComponentActivity() {
         java.io.File(filesDir, "reference-run.bin").delete()
     }
 
-    /** Keeps the no-lens run as the reference and moves on to measuring the lens size. */
-    private fun finishReferenceRun() {
-        showCaptureQualitySummary()
-        val down = lastMonitorDown
-        val periods = nativeEngine.saveReferenceRun(down[0], down[1])
-        if (periods == null) {
-            actionView.text = "NOW: The reference run couldn't be saved. Tap “Reset capture”"
+    /** Reference run, grid page: collect no-lens grid frames while lined up and still. */
+    private fun collectGridReference(
+        cameraImage: Image,
+        guide: Pair<Boolean, String>,
+        gridShowing: Boolean
+    ) {
+        if (guide.first && gridShowing && gridReferenceFrames < GRID_REFERENCE_FRAMES) {
+            val plane = cameraImage.planes[0]
+            gridReferenceFrames = nativeEngine.addGridReferenceFrame(
+                plane.buffer.slice(), cameraImage.width, cameraImage.height,
+                plane.rowStride, plane.pixelStride
+            )
+            // The grid is the whole reference run: done once enough frames are averaged.
+            if (gridReferenceFrames >= GRID_REFERENCE_FRAMES) {
+                runOnUiThread { finishReferenceRun() }
+                return
+            }
+        }
+        publishAlignment(
+            guide.first, guide.second,
+            "No key. Grid reference ($gridReferenceFrames frames)",
+            if (guide.first) "HOLD STILL. DON'T PRESS ANY KEY. Grid reference" else dontPress(guide.second)
+        )
+    }
+
+    /**
+     * Single-frame method: each grid frame gives a full measurement, so shake between frames
+     * doesn't matter. Results from the last few seconds are combined once there are enough.
+     */
+    private fun processGridLensFrame(frame: Frame, cameraImage: Image, monitorDown: FloatArray) {
+        // Same grid as the result just shown: wait for the next one (G) before measuring again.
+        if (gridWaitingForNewGrid) return
+        gridShowingResult = false
+        // The circle is drawn on every frame so it keeps up with the live picture.
+        showLensGuide(frame, cameraImage, lastGridStatus == 0)
+        // Measuring takes a few tenths of a second, far longer than a frame. Done here it held
+        // up the preview (seconds behind); instead hand a copy of the latest frame to a
+        // background worker and skip frames while it is busy.
+        if (!gridWorkerBusy.compareAndSet(false, true)) return
+        val width = cameraImage.width
+        val height = cameraImage.height
+        val copy = gridFrameCopy?.takeIf { it.capacity() == width * height }
+            ?: ByteBuffer.allocateDirect(width * height).also { gridFrameCopy = it }
+        val plane = cameraImage.planes[0]
+        val source = plane.buffer.duplicate()
+        copy.clear()
+        for (row in 0 until height) {
+            source.limit(min(source.capacity(), row * plane.rowStride + width * plane.pixelStride))
+            source.position(row * plane.rowStride)
+            if (plane.pixelStride == 1) {
+                copy.put(source)
+            } else {
+                for (column in 0 until width) copy.put(source.get(row * plane.rowStride + column * plane.pixelStride))
+            }
+        }
+        copy.flip()
+        val down = monitorDown.copyOf()
+        gridWorker.execute {
+            try {
+                measureGridCopy(copy, width, height, down)
+            } finally {
+                gridWorkerBusy.set(false)
+            }
+        }
+    }
+
+    /** Runs on the grid worker thread with a private copy of one frame's Y plane. */
+    private fun measureGridCopy(copy: ByteBuffer, width: Int, height: Int, monitorDown: FloatArray) {
+        if (gridWaitingForNewGrid) return
+        val result = nativeEngine.measureGridFrame(
+            copy, width, height, width, 1, monitorDown[0], monitorDown[1],
+            width / 2f, height / 2f, expectedLensRadiusPixels(),
+            screenDistanceMm.toFloat(), screenOpeningPixels, ASSUMED_LENS_DISTANCE_MM
+        ) ?: return
+        val now = System.currentTimeMillis()
+        val status = result[0].toInt()
+        lastGridStatus = status
+        gridStatusCounts[status] = (gridStatusCounts[status] ?: 0) + 1
+        // A real lens frame now and then, for offline analysis.
+        if (status != 0 && now - lastDiagnosticFrameMs > DIAGNOSTIC_FRAME_INTERVAL_MS) {
+            lastDiagnosticFrameMs = now
+            saveGrayscaleBytes(copy, width, height, "grid-lens-$status-${savedGridFrames++ % 4}.pgm")
+            Log.d(LOG_TAG, "saved grid lens frame; screen opening $screenOpeningPixels px, " +
+                "screen $screenDistanceMm mm, down ${monitorDown[0]}, ${monitorDown[1]}")
+        }
+        if (status == 0) gridResults.addLast(now to result)
+        while (gridResults.isNotEmpty() && now - gridResults.first().first > GRID_RESULT_WINDOW_MS) {
+            gridResults.removeFirst()
+        }
+        if (now - lastGridLogMs >= 1000L) {
+            lastGridLogMs = now
+            Log.d(LOG_TAG, "grid frames: status counts $gridStatusCounts, ${gridResults.size} " +
+                "recent good" + if (status == 0) String.format(
+                    Locale.US, "; last %+.2f %+.2f x %.0f at %.0f mm, %d px, rms %.2f",
+                    result[1], result[2], result[3], result[4], result[6].toInt(), result[7]
+                ) else "")
+            gridStatusCounts.clear()
+        }
+        if (gridResults.size >= GRID_RESULTS_NEEDED) {
+            val combined = combineGridResults(gridResults.map { it.second })
+            gridResults.clear()
+            gridShowingResult = true
+            gridWaitingForNewGrid = true
+            runOnUiThread { showGridResult(combined) }
             return
         }
-        screenDistanceMm = alignmentSamples.lastOrNull()?.depthMm ?: TARGET_WORKING_DISTANCE_MM
-        val finest = periods.filter { it > 0f }.minOrNull()
-        val fringeWarning = if (finest != null && finest < MIN_FRINGE_PERIOD_PIXELS) {
+        val hint = when (status) {
+            0 -> "Measuring… ${gridResults.size}/$GRID_RESULTS_NEEDED"
+            1 -> "Looking for the lens: center it in front of the camera"
+            2 -> "Lens outline runs off the picture: hold it a little farther from the camera"
+            else -> "Measuring… ${gridResults.size}/$GRID_RESULTS_NEEDED"
+        }
+        publishAlignment(true, hint, "No key. Grid measurement running", "HOLD THE GLASSES STEADY · $hint")
+    }
+
+    /**
+     * Lens radius in image pixels at a quarter of the screen distance (4× its size there), or
+     * for glasses without a measurable rim, a typical 20 mm lens radius at the assumed distance.
+     */
+    private fun expectedLensRadiusPixels() = if (screenOpeningPixels > 0f) {
+        4f * screenOpeningPixels / sqrt(Math.PI.toFloat())
+    } else {
+        lastFocalPixels * TYPICAL_LENS_RADIUS_MM / ASSUMED_LENS_DISTANCE_MM
+    }
+
+    /**
+     * Circle in the preview where the lens should be: the image center, sized as the lens
+     * opening looks from a quarter of the screen distance (4× its size on the screen).
+     */
+    private fun showLensGuide(frame: Frame, cameraImage: Image, measuring: Boolean) {
+        val focal = FloatArray(2)
+        calibratedFocalLength(frame, focal)
+        lastFocalPixels = (focal[0] + focal[1]) / 2f
+        val centerX = cameraImage.width / 2f
+        val centerY = cameraImage.height / 2f
+        val radiusImage = expectedLensRadiusPixels()
+        val center = transformPoint(frame, Coordinates2d.IMAGE_PIXELS, Coordinates2d.VIEW, centerX, centerY)
+        val edge = transformPoint(
+            frame, Coordinates2d.IMAGE_PIXELS, Coordinates2d.VIEW, centerX + radiusImage, centerY
+        )
+        val radius = hypot(edge[0] - center[0], edge[1] - center[1])
+        if (!radius.isFinite()) return
+        overlayView.update(
+            AlignmentOverlayView.State(
+                null, null, false, emptyList(),
+                AlignmentOverlayView.LensGuide(center[0], center[1], radius, measuring)
+            )
+        )
+    }
+
+    /** Median of (sphere, cylinder, axis) triples in power-vector form, so axes average properly. */
+    private fun medianPrescription(sphere: List<Float>, cylinder: List<Float>, axis: List<Float>): FloatArray {
+        fun median(values: List<Double>) = values.sorted()[values.size / 2]
+        val mean = sphere.indices.map { sphere[it] + cylinder[it] / 2.0 }
+        val j0 = sphere.indices.map { -(cylinder[it] / 2.0) * cos(2.0 * Math.toRadians(axis[it].toDouble())) }
+        val j45 = sphere.indices.map { -(cylinder[it] / 2.0) * sin(2.0 * Math.toRadians(axis[it].toDouble())) }
+        val m = median(mean)
+        val jc = median(j0)
+        val js = median(j45)
+        val combinedCylinder = -2.0 * hypot(jc, js)
+        var combinedAxis = Math.toDegrees(0.5 * atan2(js, jc))
+        if (combinedAxis <= 0.5) combinedAxis += 180.0
+        val sortedMean = mean.sorted()
+        val spread = (sortedMean[sortedMean.size * 3 / 4] - sortedMean[sortedMean.size / 4]) / 2.0
+        return floatArrayOf(
+            (m - combinedCylinder / 2.0).toFloat(), combinedCylinder.toFloat(), combinedAxis.toFloat(),
+            spread.toFloat()
+        )
+    }
+
+    /**
+     * Combines the frame results. Returns {type, sphere, cylinder, axis, distance mm, spread,
+     * add}: for multifocals (majority of frames) the sphere/cylinder/axis are the distance zone's.
+     */
+    private fun combineGridResults(results: List<FloatArray>): FloatArray {
+        val multifocal = results.filter { it.size >= 16 && it[8] >= 1f }
+        val useZones = multifocal.size * 2 > results.size
+        val chosen = if (useZones) multifocal else results
+        val (s, c, a) = if (useZones) Triple(9, 10, 11) else Triple(1, 2, 3)
+        val rx = medianPrescription(chosen.map { it[s] }, chosen.map { it[c] }, chosen.map { it[a] })
+        val type = if (!useZones) 0f else chosen.map { it[8] }.sorted()[chosen.size / 2]
+        val add = if (useZones) chosen.map { it[15] }.sorted()[chosen.size / 2] else 0f
+        return floatArrayOf(
+            type, rx[0], rx[1], rx[2],
+            results.map { it[4] }.sorted()[results.size / 2], rx[3], add
+        )
+    }
+
+    private fun showGridResult(combined: FloatArray) {
+        fun quarter(value: Float) = (value * 4f).roundToInt() / 4f
+        val type = combined[0].roundToInt()
+        val typeName = when (type) { 1 -> "bifocal"; 2 -> "progressive"; else -> "single vision" }
+        actionView.text = if (type == 0) {
             String.format(
-                Locale.US,
-                " · Fringes are only %.1f camera pixels apart: for lens runs raise " +
-                    "“Fringe period” on the page about %.0f× and redo the reference (Reset).",
-                finest, ceil(MIN_FRINGE_PERIOD_PIXELS / finest)
+                Locale.US, "DONE: SPH %+.2f   CYL %+.2f   AXIS %d",
+                quarter(combined[1]), quarter(combined[2]), combined[3].roundToInt()
             )
         } else {
-            ""
+            String.format(
+                Locale.US, "DONE (%s): SPH %+.2f  CYL %+.2f  AXIS %d  ADD %+.2f",
+                typeName, quarter(combined[1]), quarter(combined[2]), combined[3].roundToInt(),
+                quarter(combined[6])
+            )
+        }
+        detectionView.text = String.format(
+            Locale.US,
+            "PHONE: %s · unrounded %+.2f %+.2f × %.0f%s from %d frames (spread ±%.2f D) · lens " +
+                "%.0f mm from camera · axis assumes the arms point toward the phone",
+            typeName.replaceFirstChar { it.uppercase() }, combined[1], combined[2], combined[3],
+            if (type == 0) "" else String.format(Locale.US, " add %+.2f", combined[6]),
+            GRID_RESULTS_NEEDED, combined[5], combined[4]
+        )
+        statusView.text = "KEYBOARD: G measures again (same setup). Another lens: L. New setup: Reset"
+        Log.d(LOG_TAG, "grid result: ${combined.joinToString()}")
+        updateCaptureButton()
+    }
+
+    /** Keeps the no-lens run as the reference and moves on to measuring the lens size. */
+    private fun finishReferenceRun() {
+        val down = lastMonitorDown
+        screenDistanceMm = alignmentSamples.lastOrNull()?.depthMm ?: TARGET_WORKING_DISTANCE_MM
+        val gridPeriods = nativeEngine.finishGridReference(
+            down[0], down[1], java.io.File(getExternalFilesDir(null), "grid-reference.pgm").absolutePath
+        )
+        Log.d(LOG_TAG, "grid reference saved; bullseye ${lastAlignmentTarget?.centerX}, " +
+            "${lastAlignmentTarget?.centerY}, size ${lastAlignmentTarget?.size}; down " +
+            "${down[0]}, ${down[1]}; screen ${screenDistanceMm} mm")
+        if (gridPeriods == null) {
+            gridReferenceFrames = 0
+            actionView.text = "NOW: The grid couldn't be read. Reload the page, then PRESS RETURN " +
+                "to redo the reference"
+            return
         }
         captureComplete = false
-        captureAxis = AXIS_X
-        capturePhase = 0
-        collectedFrames = 0
         stage = Stage.LENS_SIZE
         overlayView.update(null)
         actionView.text = "NOW: Reference done. ${lensSizePrompt()}"
         statusView.text = "KEYBOARD: Press L for the white lens-size screen"
-        detectionView.text = "PHONE: Leave the phone where it is. ${detectionView.text}$fringeWarning"
+        detectionView.text = String.format(
+            Locale.US, "PHONE: Leave the phone where it is · grid %.1f px per period · screen %d cm",
+            gridPeriods.minOrNull() ?: 0f, screenDistanceMm / 10
+        )
     }
 
     /** Runs on the camera thread when “Measure lens size” was tapped. */
@@ -1277,8 +1643,19 @@ class MainActivity : ComponentActivity() {
         val target = lastAlignmentTarget ?: return
         // Only on the white lens-size screen, which says so with its own step squares; anything
         // else (e.g. the bullseye's ring) could pass for a lens opening.
-        if (decodeRemoteSquares(cameraImage, target, monitorDown) != LENS_SIZE_SCREEN_CODE) {
+        val screenCode = decodeRemoteSquares(cameraImage, target, monitorDown)
+        // The white screen came and went without a rim being found (half-rim, rimless or
+        // gold frame): carry on with an assumed distance instead of a measured size.
+        if (sawLensSizeScreen && screenCode == GRID_CODE) {
+            sawLensSizeScreen = false
+            Log.d(LOG_TAG, "lens size: no rim found; assuming $ASSUMED_LENS_DISTANCE_MM mm")
+            runOnUiThread { lensSizeMeasured(-1f, 0f) }
+            return
+        }
+        if (screenCode == LENS_SIZE_SCREEN_CODE) sawLensSizeScreen = true
+        if (screenCode != LENS_SIZE_SCREEN_CODE) {
             lensOpeningSamples.clear()
+            logLensSizeState(cameraImage, "page code $screenCode (want $LENS_SIZE_SCREEN_CODE)")
             val now = System.currentTimeMillis()
             if (now - lastAlignmentUiMs >= ALIGNMENT_UI_INTERVAL_MS) {
                 lastAlignmentUiMs = now
@@ -1301,25 +1678,23 @@ class MainActivity : ComponentActivity() {
         // Without glasses the only opening around the cross is the whole screen: too big.
         val lensSized = opening > 0f && openingMm <= MAX_LENS_OPENING_MM
         if (lensSized) lensOpeningSamples.addLast(opening) else lensOpeningSamples.clear()
+        logLensSizeState(
+            cameraImage,
+            "white screen seen; opening ${"%.1f".format(opening)} px = " +
+                "${"%.1f".format(openingMm)} mm, ${lensOpeningSamples.size} steady readings"
+        )
         while (lensOpeningSamples.size > LENS_SIZE_STABLE_FRAMES) lensOpeningSamples.removeFirst()
 
         val stable = lensOpeningSamples.size == LENS_SIZE_STABLE_FRAMES &&
             lensOpeningSamples.maxOrNull()!! - lensOpeningSamples.minOrNull()!! <=
             LENS_SIZE_TOLERANCE * lensOpeningSamples.average()
-        if (stable || (lensSizeRequested && lensSized)) {
-            lensSizeRequested = false
+        if (stable) {
             val accepted = lensOpeningSamples.sorted()[lensOpeningSamples.size / 2]
             lensOpeningSamples.clear()
             Log.d(LOG_TAG, "lens size accepted: $accepted px (${accepted * BULLSEYE_DIAMETER_MM / bullseyePixels} mm)")
             runOnUiThread {
                 lensSizeMeasured(accepted, accepted * BULLSEYE_DIAMETER_MM / bullseyePixels)
             }
-            return
-        }
-        if (lensSizeRequested && !lensSized) {
-            lensSizeRequested = false
-            saveGrayscaleFrame(cameraImage, "lens-size-failed.pgm")
-            runOnUiThread { lensSizeMeasured(-1f, 0f) }
             return
         }
         val now = System.currentTimeMillis()
@@ -1332,6 +1707,33 @@ class MainActivity : ComponentActivity() {
             } else {
                 "NOW: Hold the glasses still… measuring ($progress/$LENS_SIZE_STABLE_FRAMES)"
             }
+        }
+    }
+
+    /** Once a second during the lens-size step: what it sees, plus a picture for diagnosis. */
+    private fun logLensSizeState(cameraImage: Image, state: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastDiagnosticFrameMs < 1000L) return
+        lastDiagnosticFrameMs = now
+        Log.d(LOG_TAG, "lens size step: $state")
+        if (now - lastLensSizeSaveMs >= 5000L) {
+            lastLensSizeSaveMs = now
+            saveGrayscaleFrame(cameraImage, "lens-size-step.pgm")
+        }
+    }
+
+    /** Saves a tightly packed grey frame as a PGM in the app's files directory. */
+    private fun saveGrayscaleBytes(pixels: ByteBuffer, width: Int, height: Int, name: String) {
+        try {
+            val bytes = ByteArray(width * height)
+            pixels.duplicate().apply { position(0) }.get(bytes)
+            val file = java.io.File(getExternalFilesDir(null), name)
+            file.outputStream().use { output ->
+                output.write("P5\n$width $height\n255\n".toByteArray())
+                output.write(bytes)
+            }
+        } catch (error: Exception) {
+            Log.d(LOG_TAG, "could not save frame: ${error.localizedMessage}")
         }
     }
 
@@ -1350,39 +1752,36 @@ class MainActivity : ComponentActivity() {
                 output.write("P5\n${cameraImage.width} ${cameraImage.height}\n255\n".toByteArray())
                 output.write(pixels)
             }
-            Log.d(LOG_TAG, "saved ${file.absolutePath}")
+
         } catch (error: Exception) {
             Log.d(LOG_TAG, "could not save frame: ${error.localizedMessage}")
         }
     }
 
-    /** Lens-size instructions; while on the right lens they keep the left result in view. */
-    private fun lensSizePrompt(): String {
-        val leftDone = if (currentEye == Eye.RIGHT && eyeResults[Eye.LEFT] != null) {
-            "Left lens ${formatResult(Eye.LEFT)}. "
-        } else {
-            ""
-        }
-        return "${leftDone}${currentEye.label} lens: press L on the computer for the white " +
-            "screen and hold the glasses flat on it with the ${currentEye.label.lowercase()} " +
-            "lens centered on the cross. It measures by itself"
-    }
+    /** Lens-size instructions (L shows the white screen, which ends by itself after 8 s). */
+    private fun lensSizePrompt() = "Lens size: press L on the computer and hold the glasses " +
+        "flat on the white screen with the lens to measure on the cross for a few seconds"
 
     private fun lensSizeMeasured(openingPixels: Float, openingMm: Float) {
-        if (openingPixels <= 0f) {
-            actionView.text = "NOW: Couldn't find the lens rim around the cross. Check the white " +
-                "screen is showing (L) and one lens is centered on the cross, then tap " +
-                "“Measure lens size” again"
-            return
-        }
+        sawLensSizeScreen = false
         screenOpeningPixels = openingPixels
+        // The white screen is still up; don't take its continuing presence as a new request.
+        lensStagePreviousCode = LENS_SIZE_SCREEN_CODE
         stage = Stage.LENS
-        detectionView.text = String.format(
-            Locale.US, "PHONE: %s lens opening ≈ %.0f mm across (seen from %d cm)",
-            currentEye.label.lowercase().replaceFirstChar { it.uppercase() }, openingMm,
-            screenDistanceMm / 10
-        )
+        detectionView.text = if (openingPixels > 0f) {
+            String.format(
+                Locale.US, "PHONE: Lens opening ≈ %.0f mm across (seen from %d cm)",
+                openingMm, screenDistanceMm / 10
+            )
+        } else {
+            "PHONE: No full rim found, so no lens size: rest the temple tips on the phone " +
+                "mount (lens taken as ${(ASSUMED_LENS_DISTANCE_MM / 10).roundToInt()} cm away)"
+        }
         startLensRun()
+        if (openingPixels <= 0f) {
+            actionView.text = "NOW: Rest the temple tips on the phone mount, lens in the circle, " +
+                "and hold still. It measures by itself"
+        }
     }
 
     /** Clears the previous lens run (the reference is kept) and waits for the pages. */
@@ -1396,19 +1795,17 @@ class MainActivity : ComponentActivity() {
         candidateScreen = -1 to false
         candidateScreenFrames = 0
         stableScreen = -1 to false
-        autoArmPaused = false
         // Armed straight away: the lens run never sees the bullseye, so it can't wait for one.
         pendingCapture.set(ArmedCapture(CaptureRequest(AXIS_X, 0)))
         val lensDistanceCm = (screenDistanceMm / 4f / 10f).roundToInt()
-        actionView.text = "NOW: ${currentEye.label} lens: PRESS R, then hold the glasses with " +
-            "both hands about $lensDistanceCm cm in front of the camera, arms toward the phone, " +
-            "${currentEye.label.lowercase()} lens centered on the camera. Hold steady; it " +
-            "measures by itself"
-        statusView.text = "KEYBOARD: R starts the lens loop (5-second countdown)"
+        actionView.text = "NOW: Hold the glasses with both hands about $lensDistanceCm cm in " +
+            "front of the camera, arms toward the phone, the same lens centered on the camera. " +
+            "Hold steady; the lens run starts by itself"
+        statusView.text = "KEYBOARD: No key needed (G restarts the grid if time runs out)"
         updateCaptureButton()
     }
 
-    /** Compares the lens run with the reference; left lens first, then the right. */
+    /** Compares the lens run with the reference and shows the lens's prescription. */
     private fun finishLensRun() {
         val down = lastMonitorDown
         val result = nativeEngine.measureLensFromRuns(
@@ -1417,16 +1814,15 @@ class MainActivity : ComponentActivity() {
             java.io.File(getExternalFilesDir(null), "lens-brightness-ratio.pgm").absolutePath
         )
         val status = result?.getOrNull(0)?.toInt() ?: 5
-        val eye = currentEye.label.lowercase()
         if (status != 0 || result == null) {
-            // Re-arm the same lens so the fix is just R, then RETURN on the computer.
+            // Re-arm so the looping pages give it another try without a key press.
             startLensRun()
             val lensDistanceCm = (screenDistanceMm / 4f / 10f).roundToInt()
             actionView.text = "NOW: " + when (status) {
-                1 -> "Couldn't find the $eye lens in the picture. Center it in front of the " +
+                1 -> "Couldn't find the lens in the picture. Center it in front of the " +
                     "camera, about $lensDistanceCm cm away, and hold steady; it tries again " +
                     "when step 1 comes round"
-                2 -> "The $eye lens outline runs off the picture or the rim isn't fully visible. " +
+                2 -> "The lens outline runs off the picture or the rim isn't fully visible. " +
                     "Hold the glasses a little farther from the camera; it tries again when " +
                     "step 1 comes round"
                 3 -> "Too little usable area inside the lens. Raise “Fringe period” on the page, " +
@@ -1439,34 +1835,18 @@ class MainActivity : ComponentActivity() {
         }
 
         fun quarter(value: Float) = (value * 4f).roundToInt() / 4f
-        eyeResults[currentEye] = floatArrayOf(quarter(result[1]), quarter(result[2]), result[3])
+        actionView.text = String.format(
+            Locale.US, "DONE: SPH %+.2f   CYL %+.2f   AXIS %d",
+            quarter(result[1]), quarter(result[2]), result[3].roundToInt()
+        )
         detectionView.text = String.format(
             Locale.US,
-            "PHONE: %s unrounded %+.2f %+.2f × %.0f · lens %.0f mm from camera · %d points · " +
+            "PHONE: Unrounded %+.2f %+.2f × %.0f · lens %.0f mm from camera · %d points · " +
                 "fit error %.2f px · axis assumes the arms point toward the phone",
-            currentEye.code, result[1], result[2], result[3], result[4], result[6].toInt(), result[7]
+            result[1], result[2], result[3], result[4], result[6].toInt(), result[7]
         )
-        if (currentEye == Eye.LEFT) {
-            currentEye = Eye.RIGHT
-            stage = Stage.LENS_SIZE
-            screenOpeningPixels = 0f
-            captureComplete = false
-            lensOpeningSamples.clear()
-            actionView.text = "NOW: ${lensSizePrompt()}"
-            statusView.text = "KEYBOARD: Press L (stops the loop, shows the white screen)"
-            return
-        }
-        actionView.text = "DONE: OD (right) ${formatResult(Eye.RIGHT)}  ·  " +
-            "OS (left) ${formatResult(Eye.LEFT)}"
-        statusView.text = "KEYBOARD: Nothing more to press. “Reset capture” starts a new pair"
-    }
-
-    private fun formatResult(eye: Eye): String {
-        val result = eyeResults[eye] ?: return "not measured"
-        return String.format(
-            Locale.US, "SPH %+.2f  CYL %+.2f  AXIS %d",
-            result[0], result[1], result[2].roundToInt()
-        )
+        statusView.text = "KEYBOARD: Done. For another lens, tap “Reset capture” and start " +
+            "again from the beginning"
     }
 
     private fun showCaptureQualitySummary() {
@@ -1522,11 +1902,6 @@ class MainActivity : ComponentActivity() {
             else -> "Prepare step $step/8 (${phaseName(captureAxis, capturePhase)})"
         }
         captureButton.isEnabled = !captureComplete && !armed && alignmentReady
-        cancelPhaseButton.visibility = if (armed) ViewGroup.VISIBLE else ViewGroup.GONE
-        measureSizeButton.visibility =
-            if (stage == Stage.LENS_SIZE) ViewGroup.VISIBLE else ViewGroup.GONE
-        repeatLensButton.visibility =
-            if (stage == Stage.LENS && captureComplete) ViewGroup.VISIBLE else ViewGroup.GONE
     }
 
     private fun phaseName(axis: Int, phase: Int): String {
@@ -1562,26 +1937,47 @@ class MainActivity : ComponentActivity() {
         const val MAX_SIZE_JITTER = 0.015f
         const val ALIGNMENT_UI_INTERVAL_MS = 150L
         const val SCREEN_DEBOUNCE_FRAMES = 2
-        /** Hand-held glasses: grey-level change per frame that counts as moving. */
-        const val MOTION_LIMIT = 5f
-        const val MOTION_SAMPLE_STEP = 8
+        /**
+         * Hand-held glasses: grey-level change per frame that counts as moving. 5 rejected
+         * normal hand tremor (measured 5.6–7.3), so allow more.
+         */
+        const val MOTION_LIMIT = 10f
+        const val MOTION_SAMPLE_STEP = 4
+        /** Fraction of the picture's width and height, around the center, watched for motion. */
+        const val MOTION_REGION = 0.4f
         /** Frames after a page flip during which change is the monitor, not the hands. */
         const val PAGE_SETTLE_FRAMES = 3
         /** Still frames (about a third of a second) before frames are collected. */
         const val STEADY_FRAMES_NEEDED = 10
         /** Must match LENS_SIZE_SCREEN_CODE in monitor-pattern-player.html. */
         const val LENS_SIZE_SCREEN_CODE = 1
+        /** Must match LOOP_COUNTDOWN_CODE in monitor-pattern-player.html. */
+        const val LOOP_COUNTDOWN_CODE = 2
+        /** Must match GRID_CODE in monitor-pattern-player.html: the crossed grid is showing. */
+        const val GRID_CODE = 3
+        /** Good single-frame results combined into the final answer. */
+        const val GRID_RESULTS_NEEDED = 15
+        /** Lens distance used when no rim can be measured: temple tips resting on the mount. */
+        const val ASSUMED_LENS_DISTANCE_MM = 140f
+        const val TYPICAL_LENS_RADIUS_MM = 20f
+        /** No-lens grid frames averaged into the reference (matches the native maximum). */
+        const val GRID_REFERENCE_FRAMES = 32
+        /** Only results this recent count, so an early bad stretch doesn't linger. */
+        const val GRID_RESULT_WINDOW_MS = 4000L
         const val DIAGNOSTIC_FRAME_INTERVAL_MS = 5000L
+        /** "Can't read the page" pictures: one a minute is plenty and keeps the log readable. */
+        const val UNREADABLE_SAVE_INTERVAL_MS = 60000L
         /** Bullseye shift (fraction of its size, ~2.5 mm) that means the setup has moved. */
         const val SETUP_MOVED_FRACTION = 0.05f
         /** Frames averaged per fringe page; fewer if auto-advance moves on first. */
         const val FRAMES_PER_PAGE = 32
+        /** Lens-loop pages flip every 0.4 s (~12 camera frames); take 5 of them. */
+        const val LENS_FRAMES_PER_PAGE = 5
         /**
-         * Must match REMOTE_TICKS_OFFSET_MM in monitor-pattern-player.html: the second set of
-         * step squares is laid out as if under a bullseye this far below center (negative =
-         * above), putting the squares about 10 cm above the screen center.
+         * Must match REMOTE_TICK_SPOTS_MM in monitor-pattern-player.html: copies of the step
+         * squares laid out as if under a bullseye at (right, down) mm from center.
          */
-        const val REMOTE_TICKS_OFFSET_MM = -145f
+        val REMOTE_TICK_SPOTS_MM = listOf(0f to -145f, 0f to 63f, -150f to -41f, 150f to -41f)
         /** Smallest hole accepted as a lens opening when measuring its size on the screen. */
         const val MIN_LENS_OPENING_MM = 15f
         /** Larger "openings" are the bare screen, seen before the glasses are put on it. */

@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <vector>
 // File: app/src/main/cpp/phase_unwrapper.cpp
 #include "phase_unwrapper.h"
 #include <queue>
@@ -54,58 +56,52 @@ void calculateWrappedPhase(const cv::Mat& I1, const cv::Mat& I2,
     modulationMap *= 0.5f;
 }
 
-void unwrapPhaseQualityGuided(const cv::Mat& wrappedPhase, const cv::Mat& modulationMap, 
+void unwrapPhaseQualityGuided(const cv::Mat& wrappedPhase, const cv::Mat& modulationMap,
                               cv::Mat& unwrappedPhase, float modThreshold) {
-    
-    int rows = wrappedPhase.rows;
-    int cols = wrappedPhase.cols;
-    
-    // Initialize output map and a tracking mask
+    const int rows = wrappedPhase.rows;
+    const int cols = wrappedPhase.cols;
     unwrappedPhase = cv::Mat::zeros(rows, cols, CV_32F);
     cv::Mat processed = cv::Mat::zeros(rows, cols, CV_8U);
-    
-    // 1. Find the best starting seed (Highest modulation)
-    double minVal, maxVal;
-    cv::Point minLoc, maxLoc;
-    cv::minMaxLoc(modulationMap, &minVal, &maxVal, &minLoc, &maxLoc);
-    
-    std::priority_queue<PixelNode> pq;
-    
-    // 2. Initialize the seed
-    unwrappedPhase.at<float>(maxLoc.y, maxLoc.x) = wrappedPhase.at<float>(maxLoc.y, maxLoc.x);
-    processed.at<uchar>(maxLoc.y, maxLoc.x) = 1;
-    pq.push({maxLoc.x, maxLoc.y, static_cast<float>(maxVal)});
-    
-    // 4-connected neighborhood offsets (Up, Down, Left, Right)
-    int dx[] = {0, 0, -1, 1};
-    int dy[] = {-1, 1, 0, 0};
-    
-    // 3. Flood-fill from highest quality to lowest
-    while (!pq.empty()) {
-        PixelNode current = pq.top();
-        pq.pop();
-        
-        float refPhase = unwrappedPhase.at<float>(current.y, current.x);
-        
-        for (int i = 0; i < 4; ++i) {
-            int nx = current.x + dx[i];
-            int ny = current.y + dy[i];
-            
-            // Bounds check
-            if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) {
-                // If not yet processed AND modulation is above our temple-masking threshold
-                if (processed.at<uchar>(ny, nx) == 0 && modulationMap.at<float>(ny, nx) >= modThreshold) {
-                    
-                    // Read the wrapped value of the neighbor
-                    float neighborWrapped = wrappedPhase.at<float>(ny, nx);
-                    
-                    // Unwrap it relative to the current pixel
-                    unwrappedPhase.at<float>(ny, nx) = wrapDifference(neighborWrapped, refPhase);
-                    
-                    // Mark as processed and add to queue
-                    processed.at<uchar>(ny, nx) = 1;
-                    pq.push({nx, ny, modulationMap.at<float>(ny, nx)});
-                }
+
+    // Seeds, best quality first. Each flood covers one connected usable region; regions cut
+    // off from each other (e.g. by a bifocal segment line) get their own seed, so none is
+    // left un-unwrapped. Their relative 2π offsets are arbitrary, which only shifts a
+    // constant that local fits absorb.
+    std::vector<std::pair<float, int>> seeds;
+    for (int y = 0; y < rows; ++y) {
+        const float* quality = modulationMap.ptr<float>(y);
+        for (int x = 0; x < cols; ++x) {
+            if (quality[x] >= modThreshold) seeds.emplace_back(quality[x], y * cols + x);
+        }
+    }
+    std::sort(seeds.begin(), seeds.end(),
+              [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
+
+    const int dx[] = {0, 0, -1, 1};
+    const int dy[] = {-1, 1, 0, 0};
+    std::priority_queue<PixelNode> queue;
+    for (const auto& seed : seeds) {
+        const int seedX = seed.second % cols;
+        const int seedY = seed.second / cols;
+        if (processed.at<uchar>(seedY, seedX)) continue;
+        unwrappedPhase.at<float>(seedY, seedX) = wrappedPhase.at<float>(seedY, seedX);
+        processed.at<uchar>(seedY, seedX) = 1;
+        queue.push({seedX, seedY, seed.first});
+
+        // Flood-fill from highest quality to lowest.
+        while (!queue.empty()) {
+            const PixelNode current = queue.top();
+            queue.pop();
+            const float referencePhase = unwrappedPhase.at<float>(current.y, current.x);
+            for (int i = 0; i < 4; ++i) {
+                const int nx = current.x + dx[i];
+                const int ny = current.y + dy[i];
+                if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue;
+                if (processed.at<uchar>(ny, nx) != 0 || modulationMap.at<float>(ny, nx) < modThreshold) continue;
+                unwrappedPhase.at<float>(ny, nx) =
+                        wrapDifference(wrappedPhase.at<float>(ny, nx), referencePhase);
+                processed.at<uchar>(ny, nx) = 1;
+                queue.push({nx, ny, modulationMap.at<float>(ny, nx)});
             }
         }
     }

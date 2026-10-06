@@ -55,6 +55,25 @@ public class NativeLensEngine {
 
     public native void resetPhaseCapture();
 
+    /** Adds one no-lens grid frame to the single-frame method's reference. Returns the count. */
+    public native int addGridReferenceFrame(
+            ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride);
+
+    /** Finishes the grid reference. Returns {X, Y} camera pixels per period, or null. */
+    public native float[] finishGridReference(float monitorDownX, float monitorDownY, String debugPath);
+
+    /**
+     * Measures the lens from one grid frame (single-frame method). Same first 8 values as
+     * measureLensFromRuns (status 10 = no grid reference), then {lens type (0 single vision,
+     * 1 bifocal, 2 progressive), distance sphere, cylinder, axis, near sphere, cylinder, axis,
+     * add}.
+     */
+    public native float[] measureGridFrame(
+            ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride,
+            float monitorDownX, float monitorDownY, float lensCenterX, float lensCenterY,
+            float expectedLensRadius, float screenDistanceMm, float screenOpeningPixels,
+            float assumedLensDistanceMm);
+
     /** Forgets the stored no-lens reference run. */
     public native void clearReferenceRun();
 

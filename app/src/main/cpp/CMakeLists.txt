@@ -36,6 +36,7 @@ if(ANDROID)
             alignment_detector.cpp
             frame_stack.cpp
             lens_measurement.cpp
+            grid_ftp.cpp
             aberration_removal.cpp
             depth16_filter.cpp
             phase_unwrapper.cpp
@@ -75,6 +76,7 @@ if(NOT ANDROID)
         alignment_detector.cpp
         frame_stack.cpp
         lens_measurement.cpp
+        grid_ftp.cpp
         zernike_fitter.cpp
         phase_unwrapper.cpp
         wavefront_calibrator.cpp 

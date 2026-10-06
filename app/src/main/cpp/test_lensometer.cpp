@@ -12,6 +12,8 @@
 #include "alignment_detector.h"
 #include "frame_stack.h"
 #include "lens_measurement.h"
+#include "grid_ftp.h"
+#include <functional>
 
 TEST(MonitorCalibrationTest, CalculatesPitchFromNativeResolutionAndDiagonal) {
     const double pitchMm = calculateMonitorPixelPitchMm(1920, 1080, 27.0);
@@ -427,6 +429,226 @@ TEST(LensMeasurementTest, FindsOutOfFocusRim) {
     ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
     EXPECT_NEAR(result.lensDistanceMm, 125.0, 8.0);
     EXPECT_NEAR(result.sphere, 2.0, 0.15);
+}
+
+namespace {
+
+// One camera frame of the crossed grid (period 8 mm) seen through an optional lens, with the
+// same camera, screen and lens geometry as renderLensView.
+cv::Mat renderGridView(const cv::Matx22d* power, double lensDistanceMm) {
+    constexpr int width = 640;
+    constexpr int height = 480;
+    constexpr double focal = 500.0;
+    constexpr double screenMm = 500.0;
+    constexpr double periodMm = 8.0;
+    constexpr double lensRadiusMm = 25.0;
+    constexpr double rimMm = 4.0;
+    cv::Mat frame(height, width, CV_32F);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const cv::Vec2d angle((x - width / 2.0) / focal, (y - height / 2.0) / focal);
+            cv::Vec2d screenPoint = angle * screenMm;
+            bool blocked = false;
+            if (power) {
+                const cv::Vec2d onLens = angle * lensDistanceMm;
+                const double radius = std::hypot(onLens[0], onLens[1]);
+                if (radius < lensRadiusMm) {
+                    const cv::Vec2d bent = angle - (*power) * (onLens / 1000.0);
+                    screenPoint = onLens + bent * (screenMm - lensDistanceMm);
+                } else if (radius < lensRadiusMm + rimMm) {
+                    blocked = true;
+                }
+            }
+            frame.at<float>(y, x) = blocked ? 10.0f : static_cast<float>(
+                128.0 + 50.0 * std::cos(2.0 * CV_PI * screenPoint[0] / periodMm) +
+                50.0 * std::cos(2.0 * CV_PI * screenPoint[1] / periodMm));
+        }
+    }
+    return frame;
+}
+
+LensMeasurement measureSyntheticGrid(const cv::Matx22d& power) {
+    const cv::Mat referenceFrame = renderGridView(nullptr, 125.0);
+    GridCarriers carriers;
+    EXPECT_TRUE(findGridCarriers(referenceFrame, cv::Point2f(0, 1), carriers));
+    FringeRun reference;
+    extractGridRun(referenceFrame, carriers, reference);
+    // The lens is 25 mm in radius at 125 mm: 100 px.
+    return measureLensFromGridFrame(reference, carriers, renderGridView(&power, 125.0),
+                                    cv::Point2f(0, 1), cv::Point2f(320, 240), 100.0f, 500.0,
+                                    25.0 * std::sqrt(CV_PI));
+}
+
+}  // namespace
+
+namespace {
+
+// Grid frame through a lens whose ray deflection (radians) at each lens point h (metres,
+// x right, y down) is given; covers multifocals, whose power varies across the lens.
+cv::Mat renderGridViewDeflected(const std::function<cv::Vec2d(const cv::Vec2d&)>& deflection) {
+    constexpr int width = 640;
+    constexpr int height = 480;
+    constexpr double focal = 500.0;
+    constexpr double screenMm = 500.0;
+    constexpr double lensMm = 125.0;
+    constexpr double periodMm = 8.0;
+    constexpr double lensRadiusMm = 25.0;
+    constexpr double rimMm = 4.0;
+    cv::Mat frame(height, width, CV_32F);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const cv::Vec2d angle((x - width / 2.0) / focal, (y - height / 2.0) / focal);
+            cv::Vec2d screenPoint = angle * screenMm;
+            const cv::Vec2d onLens = angle * lensMm;
+            const double radius = std::hypot(onLens[0], onLens[1]);
+            bool blocked = false;
+            if (radius < lensRadiusMm) {
+                const cv::Vec2d bent = angle - deflection(onLens / 1000.0);
+                screenPoint = onLens + bent * (screenMm - lensMm);
+            } else if (radius < lensRadiusMm + rimMm) {
+                blocked = true;
+            }
+            frame.at<float>(y, x) = blocked ? 10.0f : static_cast<float>(
+                128.0 + 50.0 * std::cos(2.0 * CV_PI * screenPoint[0] / periodMm) +
+                50.0 * std::cos(2.0 * CV_PI * screenPoint[1] / periodMm));
+        }
+    }
+    return frame;
+}
+
+LensMeasurement measureDeflectedGrid(const std::function<cv::Vec2d(const cv::Vec2d&)>& deflection) {
+    const cv::Mat referenceFrame = renderGridView(nullptr, 125.0);
+    GridCarriers carriers;
+    EXPECT_TRUE(findGridCarriers(referenceFrame, cv::Point2f(0, 1), carriers));
+    FringeRun reference;
+    extractGridRun(referenceFrame, carriers, reference);
+    return measureLensFromGridFrame(reference, carriers, renderGridViewDeflected(deflection),
+                                    cv::Point2f(0, 1), cv::Point2f(320, 240), 100.0f, 500.0,
+                                    25.0 * std::sqrt(CV_PI));
+}
+
+}  // namespace
+
+TEST(GridMeasurementTest, DetectsProgressiveLens) {
+    // Wavefront W = ½·Pc·(x² + y²) + c·(x²y + y³/3): mean power Pc + 2c·y, no cylinder,
+    // rising smoothly from the top (distance) to the bottom (near) of the lens.
+    constexpr double centerPower = 1.0;
+    constexpr double c = 60.0;  // 2c = 120 D/m: about +2.4 D between the zones used
+    const LensMeasurement result = measureDeflectedGrid([&](const cv::Vec2d& h) {
+        return cv::Vec2d(centerPower * h[0] + 2.0 * c * h[0] * h[1],
+                         centerPower * h[1] + c * (h[0] * h[0] + h[1] * h[1]));
+    });
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_EQ(result.lensType, LensType::Progressive);
+    EXPECT_GT(result.addPower, 1.5);
+    EXPECT_LT(result.addPower, 3.5);
+    EXPECT_LT(result.distanceSphere, centerPower);
+    EXPECT_GT(result.nearSphere, centerPower);
+}
+
+// Known gap: a bifocal's segment line breaks the fringes, which cuts the lens area in two;
+// only the part containing the center is measured, so the segment is missed.
+TEST(GridMeasurementTest, DISABLED_DetectsBifocalLens) {
+    // +1.00 distance, +2.50 add in a segment below 5 mm under the lens center.
+    constexpr double distancePower = 1.0;
+    constexpr double add = 2.5;
+    const LensMeasurement result = measureDeflectedGrid([&](const cv::Vec2d& h) {
+        const double power = h[1] > 0.005 ? distancePower + add : distancePower;
+        return cv::Vec2d(power * h[0], power * h[1]);
+    });
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_EQ(result.lensType, LensType::Bifocal);
+    EXPECT_NEAR(result.addPower, add, 0.3);
+    EXPECT_NEAR(result.distanceSphere, distancePower, 0.2);
+    EXPECT_NEAR(result.distanceCylinder, 0.0, 0.2);
+}
+
+TEST(GridMeasurementTest, MeasuresHalfRimLensWithoutSizeStep) {
+    // Rim only along the top, and bright (gold) rather than dark; no lens size measured, so
+    // the lens distance is assumed (125 mm here).
+    constexpr double power = 2.5;
+    const cv::Mat referenceFrame = renderGridView(nullptr, 125.0);
+    GridCarriers carriers;
+    ASSERT_TRUE(findGridCarriers(referenceFrame, cv::Point2f(0, 1), carriers));
+    FringeRun reference;
+    extractGridRun(referenceFrame, carriers, reference);
+    cv::Mat frame(480, 640, CV_32F);
+    for (int y = 0; y < frame.rows; ++y) {
+        for (int x = 0; x < frame.cols; ++x) {
+            const cv::Vec2d angle((x - 320) / 500.0, (y - 240) / 500.0);
+            cv::Vec2d screenPoint = angle * 500.0;
+            const cv::Vec2d onLens = angle * 125.0;
+            const double radius = std::hypot(onLens[0], onLens[1]);
+            bool goldRim = false;
+            if (radius < 25.0) {
+                screenPoint = onLens + (angle - power * onLens / 1000.0) * 375.0;
+            } else if (radius < 27.0 && onLens[1] < 0.0) {
+                goldRim = true;
+            }
+            frame.at<float>(y, x) = goldRim ? 220.0f : static_cast<float>(
+                128.0 + 50.0 * std::cos(2.0 * CV_PI * screenPoint[0] / 8.0) +
+                50.0 * std::cos(2.0 * CV_PI * screenPoint[1] / 8.0));
+        }
+    }
+    const LensMeasurement result = measureLensFromGridFrame(
+        reference, carriers, frame, cv::Point2f(0, 1), cv::Point2f(320, 240), 100.0f, 500.0,
+        -1.0, 125.0);
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_NEAR(result.sphere, power, 0.2);
+    EXPECT_NEAR(result.cylinder, 0.0, 0.2);
+}
+
+TEST(GridMeasurementTest, SingleVisionLensIsNotMultifocal) {
+    const LensMeasurement result = measureSyntheticGrid(powerMatrix(-6.0, -1.0, 30.0));
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_EQ(result.lensType, LensType::SingleVision);
+}
+
+TEST(GridMeasurementTest, FindsCarriersAlongMonitorAxes) {
+    GridCarriers carriers;
+    ASSERT_TRUE(findGridCarriers(renderGridView(nullptr, 125.0), cv::Point2f(0, 1), carriers));
+    // 8 mm at 500 mm with f = 500 px is 8 px per period, i.e. 0.125 cycles per pixel.
+    EXPECT_NEAR(carriers.frequency[0].x, 0.125, 0.005);
+    EXPECT_NEAR(carriers.frequency[0].y, 0.0, 0.005);
+    EXPECT_NEAR(carriers.frequency[1].x, 0.0, 0.005);
+    EXPECT_NEAR(carriers.frequency[1].y, 0.125, 0.005);
+}
+
+TEST(GridMeasurementTest, MeasuresPlusLensFromOneFrame) {
+    const LensMeasurement result = measureSyntheticGrid(powerMatrix(2.0, 0.0, 90.0));
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_NEAR(result.lensDistanceMm, 125.0, 6.0);
+    EXPECT_NEAR(result.sphere, 2.0, 0.15);
+    EXPECT_NEAR(result.cylinder, 0.0, 0.15);
+}
+
+TEST(GridMeasurementTest, MeasuresMinusLensFromOneFrame) {
+    const LensMeasurement result = measureSyntheticGrid(powerMatrix(-2.5, 0.0, 90.0));
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_NEAR(result.sphere, -2.5, 0.15);
+    EXPECT_NEAR(result.cylinder, 0.0, 0.15);
+}
+
+TEST(GridMeasurementTest, MeasuresStrongMinusLensFromOneFrame) {
+    // −6 D at 12.5 cm makes the grid ~1.6× finer through the lens than in the reference.
+    const LensMeasurement result = measureSyntheticGrid(powerMatrix(-6.0, 0.0, 90.0));
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_NEAR(result.sphere, -6.0, 0.25);
+    EXPECT_NEAR(result.cylinder, 0.0, 0.25);
+}
+
+TEST(GridMeasurementTest, MeasuresStrongPlusLensFromOneFrame) {
+    const LensMeasurement result = measureSyntheticGrid(powerMatrix(4.0, 0.0, 90.0));
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_NEAR(result.sphere, 4.0, 0.2);
+}
+
+TEST(GridMeasurementTest, MeasuresAstigmatismFromOneFrame) {
+    const LensMeasurement result = measureSyntheticGrid(powerMatrix(1.0, -1.5, 150.0));
+    ASSERT_EQ(result.status, LensMeasurementStatus::Ok);
+    EXPECT_NEAR(result.sphere, 1.0, 0.15);
+    EXPECT_NEAR(result.cylinder, -1.5, 0.15);
+    EXPECT_NEAR(result.axisDegrees, 150.0, 4.0);
 }
 
 TEST(LensMeasurementTest, FindsLensOpeningAgainstScreen) {

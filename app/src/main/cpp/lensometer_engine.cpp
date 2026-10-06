@@ -18,6 +18,7 @@
 #include "alignment_detector.h"
 #include "frame_stack.h"
 #include "lens_measurement.h"
+#include "grid_ftp.h"
 
 #define LOG_TAG "OpenLensometer-NDK"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -63,6 +64,17 @@ constexpr size_t MAX_FRAMES_PER_PHASE = 32;
 
 // The no-lens run, kept while lens runs are captured and compared against it.
 FringeRun referenceRun;
+
+// Single-frame (grid) method: averaged no-lens grid frames, its carriers and phase maps.
+struct GridReference {
+    cv::Mat sum;
+    int frames = 0;
+    bool ready = false;
+    GridCarriers carriers;
+    FringeRun run;
+};
+GridReference gridReference;
+constexpr int MAX_GRID_REFERENCE_FRAMES = 32;
 
 std::mutex phaseCaptureMutex;
 PhaseCaptureState phaseCaptureState;
@@ -456,6 +468,7 @@ Java_com_openlensometer_engine_NativeLensEngine_clearReferenceRun(
         JNIEnv* /* env */, jobject /* this */) {
     std::lock_guard<std::mutex> lock(phaseCaptureMutex);
     referenceRun = FringeRun{};
+    gridReference = GridReference{};
 }
 
 // Keeps the just-finished run as the no-lens reference and clears capture for a lens run.
@@ -481,6 +494,142 @@ Java_com_openlensometer_engine_NativeLensEngine_saveReferenceRun(
     const jfloat values[] = {static_cast<jfloat>(periods[0]), static_cast<jfloat>(periods[1])};
     jfloatArray result = env->NewFloatArray(2);
     if (result) env->SetFloatArrayRegion(result, 0, 2, values);
+    return result;
+}
+
+// Adds one no-lens frame of the grid to the grid reference. Returns frames collected so far.
+JNIEXPORT jint JNICALL
+Java_com_openlensometer_engine_NativeLensEngine_addGridReferenceFrame(
+        JNIEnv* env, jobject /* this */, jobject yPlane,
+        jint width, jint height, jint rowStride, jint pixelStride) {
+    if (width <= 0 || height <= 0 || rowStride < width || pixelStride != 1) return -1;
+    auto* yData = static_cast<uint8_t*>(env->GetDirectBufferAddress(yPlane));
+    const jlong capacity = env->GetDirectBufferCapacity(yPlane);
+    const jlong requiredBytes = static_cast<jlong>(rowStride) * (height - 1) + width;
+    if (!yData || capacity < requiredBytes) return -2;
+    std::lock_guard<std::mutex> lock(phaseCaptureMutex);
+    if (gridReference.frames >= MAX_GRID_REFERENCE_FRAMES) return gridReference.frames;
+    const cv::Mat frame(height, width, CV_8UC1, yData, static_cast<size_t>(rowStride));
+    if (gridReference.sum.empty() || gridReference.sum.size() != frame.size()) {
+        gridReference = GridReference{};
+        gridReference.sum = cv::Mat::zeros(frame.size(), CV_32F);
+    }
+    cv::accumulate(frame, gridReference.sum);
+    return ++gridReference.frames;
+}
+
+// Averages the grid reference frames, finds the grid's two carriers and keeps the phase
+// maps. Returns {X period, Y period} in camera pixels, or null if it can't.
+JNIEXPORT jfloatArray JNICALL
+Java_com_openlensometer_engine_NativeLensEngine_finishGridReference(
+        JNIEnv* env, jobject /* this */, jfloat monitorDownX, jfloat monitorDownY,
+        jstring debugPath) {
+    std::lock_guard<std::mutex> lock(phaseCaptureMutex);
+    if (gridReference.frames == 0) return nullptr;
+    try {
+        const cv::Mat average = gridReference.sum / static_cast<double>(gridReference.frames);
+        // Keep a copy for offline analysis.
+        if (debugPath) {
+            const char* path = env->GetStringUTFChars(debugPath, nullptr);
+            cv::Mat image;
+            average.convertTo(image, CV_8U);
+            if (FILE* file = std::fopen(path, "wb")) {
+                std::fprintf(file, "P5\n%d %d\n255\n", image.cols, image.rows);
+                for (int row = 0; row < image.rows; ++row) std::fwrite(image.ptr(row), 1, image.cols, file);
+                std::fclose(file);
+            }
+            env->ReleaseStringUTFChars(debugPath, path);
+        }
+        if (!findGridCarriers(average, cv::Point2f(monitorDownX, monitorDownY),
+                              gridReference.carriers)) {
+            LOGE("Grid reference: carriers not found");
+            return nullptr;
+        }
+        extractGridRun(average, gridReference.carriers, gridReference.run);
+        gridReference.ready = true;
+    } catch (const cv::Exception& error) {
+        LOGE("Grid reference failed: %s", error.what());
+        return nullptr;
+    }
+    const jfloat values[] = {
+        static_cast<jfloat>(1.0 / cv::norm(gridReference.carriers.frequency[0])),
+        static_cast<jfloat>(1.0 / cv::norm(gridReference.carriers.frequency[1]))
+    };
+    LOGI("Grid reference from %d frames: periods %.1f / %.1f px", gridReference.frames,
+         values[0], values[1]);
+    jfloatArray result = env->NewFloatArray(2);
+    if (result) env->SetFloatArrayRegion(result, 0, 2, values);
+    return result;
+}
+
+// Measures the lens from one grid frame against the grid reference. Same result layout as
+// measureLensFromRuns ({status, sphere, cylinder, axis, distance mm, opening px, pixels, rms});
+// status 10 = no grid reference.
+JNIEXPORT jfloatArray JNICALL
+Java_com_openlensometer_engine_NativeLensEngine_measureGridFrame(
+        JNIEnv* env, jobject /* this */, jobject yPlane,
+        jint width, jint height, jint rowStride, jint pixelStride,
+        jfloat monitorDownX, jfloat monitorDownY, jfloat lensCenterX, jfloat lensCenterY,
+        jfloat expectedLensRadius, jfloat screenDistanceMm, jfloat screenOpeningPixels,
+        jfloat assumedLensDistanceMm) {
+    LensMeasurement measurement;
+    float status = 0.0f;
+    auto* yData = static_cast<uint8_t*>(env->GetDirectBufferAddress(yPlane));
+    const jlong capacity = env->GetDirectBufferCapacity(yPlane);
+    const jlong requiredBytes = static_cast<jlong>(rowStride) * (height - 1) + width;
+    if (width <= 0 || height <= 0 || rowStride < width || pixelStride != 1 ||
+            !yData || capacity < requiredBytes) {
+        status = static_cast<float>(LensMeasurementStatus::BadInput);
+    } else {
+        // Copy the reference out so the slow part runs without holding the lock.
+        FringeRun reference;
+        GridCarriers carriers;
+        bool ready = false;
+        {
+            std::lock_guard<std::mutex> lock(phaseCaptureMutex);
+            ready = gridReference.ready;
+            if (ready) {
+                reference = gridReference.run;
+                carriers = gridReference.carriers;
+            }
+        }
+        if (!ready) {
+            status = 10.0f;
+        } else {
+            try {
+                const cv::Mat frame(height, width, CV_8UC1, yData, static_cast<size_t>(rowStride));
+                measurement = measureLensFromGridFrame(
+                        reference, carriers, frame, cv::Point2f(monitorDownX, monitorDownY),
+                        cv::Point2f(lensCenterX, lensCenterY), expectedLensRadius,
+                        screenDistanceMm, screenOpeningPixels, assumedLensDistanceMm);
+                status = static_cast<float>(measurement.status);
+            } catch (const cv::Exception& error) {
+                LOGE("Grid frame measurement failed: %s", error.what());
+                status = static_cast<float>(LensMeasurementStatus::BadInput);
+            }
+        }
+    }
+    const jfloat values[] = {
+        status,
+        static_cast<jfloat>(measurement.sphere),
+        static_cast<jfloat>(measurement.cylinder),
+        static_cast<jfloat>(measurement.axisDegrees),
+        static_cast<jfloat>(measurement.lensDistanceMm),
+        static_cast<jfloat>(measurement.lensOpeningPixels),
+        static_cast<jfloat>(measurement.pixelsUsed),
+        static_cast<jfloat>(measurement.rmsResidualPixels),
+        static_cast<jfloat>(measurement.lensType),
+        static_cast<jfloat>(measurement.distanceSphere),
+        static_cast<jfloat>(measurement.distanceCylinder),
+        static_cast<jfloat>(measurement.distanceAxis),
+        static_cast<jfloat>(measurement.nearSphere),
+        static_cast<jfloat>(measurement.nearCylinder),
+        static_cast<jfloat>(measurement.nearAxis),
+        static_cast<jfloat>(measurement.addPower)
+    };
+    constexpr jsize valueCount = sizeof(values) / sizeof(values[0]);
+    jfloatArray result = env->NewFloatArray(valueCount);
+    if (result) env->SetFloatArrayRegion(result, 0, valueCount, values);
     return result;
 }
 

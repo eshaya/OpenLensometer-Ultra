@@ -25,6 +25,8 @@ enum class LensMeasurementStatus {
     BadInput = 5,
 };
 
+enum class LensType { SingleVision = 0, Bifocal = 1, Progressive = 2 };
+
 struct LensMeasurement {
     LensMeasurementStatus status = LensMeasurementStatus::BadInput;
     double sphere = 0.0;
@@ -34,6 +36,17 @@ struct LensMeasurement {
     double lensOpeningPixels = 0.0;  // sqrt(area) of the lens opening in the lens run
     int pixelsUsed = 0;
     double rmsResidualPixels = 0.0;
+    // Multifocals (power rises by ≥ 0.5 D from the top of the lens to the bottom): the
+    // whole-lens numbers above are then only an average; these come from small areas in the
+    // upper (distance) and lower (near) parts of the lens.
+    LensType lensType = LensType::SingleVision;
+    double distanceSphere = 0.0;
+    double distanceCylinder = 0.0;
+    double distanceAxis = 0.0;
+    double nearSphere = 0.0;
+    double nearCylinder = 0.0;
+    double nearAxis = 0.0;
+    double addPower = 0.0;
 };
 
 // Lens opening (sqrt of its area, in pixels) in a photo of glasses held flat against a bright
@@ -58,11 +71,14 @@ struct FringeRun {
 // screenOpeningPixels comes from measureLensOpening (glasses against the screen); the ratio to
 // the opening seen in the lens run gives the lens distance. lensCenterGuess is where the lens
 // is expected in the image (normally the image center). brightnessRatio, if given, receives
-// lens-run / reference brightness, in which the rim shows up dark (for diagnosis).
+// lens-run / reference brightness, in which the rim shows up dark (for diagnosis). Without a
+// full dark rim the lens is found by its magnification instead, and if screenOpeningPixels
+// is not positive (no size measured) the lens is taken to be assumedLensDistanceMm away.
 LensMeasurement measureLensPower(
         const FringeRun& reference, const FringeRun& lens,
         const cv::Point2f& monitorDown, const cv::Point2f& lensCenterGuess,
-        double screenDistanceMm, double screenOpeningPixels, cv::Mat* brightnessRatio = nullptr);
+        double screenDistanceMm, double screenOpeningPixels, cv::Mat* brightnessRatio = nullptr,
+        double assumedLensDistanceMm = 140.0);
 
 // Same, with the lens distance already known (used by tests).
 LensMeasurement measureLensPowerAtDistance(
