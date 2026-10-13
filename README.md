@@ -9,6 +9,18 @@ patterns shown by `monitor-pattern-player.html` on a computer monitor.
 > examination or a professional lensmeter. Do not use it to order glasses or to make decisions
 > about eye health. Provided "as is", without warranty of any kind (see LICENSE).
 
+## How it works
+
+The app uses the phone's camera to measure the optical shape of one lens at a time: its
+sphericity (sphere power), its ellipticity (cylinder power) and the direction of that
+ellipticity (axis). For bifocal and progressive lenses it also finds the near-vision add.
+
+The lens is held in front of the camera with a grid of lines behind it, displayed by a web
+browser on a computer monitor. The lens bends the lines it covers, and the app photographs
+the grid through the lens and works out the lens's power from how the lines are distorted.
+A tripod holds the phone still so the grid seen through the lens can be compared with the
+grid seen without it.
+
 ## Using it
 
 Install the app from the latest APK on the
