@@ -3,6 +3,12 @@
 Android app (Kotlin + C++/OpenCV) that measures a spectacle lens by looking through it at
 patterns shown by `monitor-pattern-player.html` on a computer monitor.
 
+> **Notice:** OpenLensometer is experimental software for educational and research use. It is
+> not a medical device and has not been cleared or approved by the FDA or any other regulator.
+> Its readings may be wrong and are not a prescription. It is no substitute for an eye
+> examination or a professional lensmeter. Do not use it to order glasses or to make decisions
+> about eye health. Provided "as is", without warranty of any kind (see LICENSE).
+
 ## Using it
 
 Install the app from the latest APK on the
