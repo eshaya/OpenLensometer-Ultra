@@ -1,0 +1,865 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lensometer Fringe Player</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "DejaVu Sans", "Segoe UI", sans-serif;
+      background: #e8e9e4;
+      color: #202523;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto minmax(240px, 1fr);
+    }
+
+    .controls {
+      display: flex;
+      align-items: end;
+      flex-wrap: wrap;
+      gap: 14px 22px;
+      padding: 16px 20px;
+      border-bottom: 1px solid #c6cbc4;
+      background: #f7f8f3;
+    }
+
+    .brand { min-width: 210px; margin-right: auto; }
+    h1 { margin: 0; font-size: 18px; font-weight: 650; }
+    .readout { margin-top: 4px; color: #4e5a55; font: 12px ui-monospace, monospace; }
+
+    label {
+      display: grid;
+      gap: 5px;
+      color: #4e5a55;
+      font-size: 12px;
+    }
+
+    input, button {
+      min-height: 40px;
+      border: 1px solid #aeb6ae;
+      border-radius: 3px;
+      background: #fff;
+      color: #202523;
+      font: inherit;
+    }
+
+    input[type="number"] { width: 104px; padding: 0 9px; }
+    input[type="range"] { width: 150px; accent-color: #146b58; }
+
+    button {
+      padding: 0 14px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    button.primary { border-color: #146b58; background: #146b58; color: #fff; }
+    button:hover { border-color: #146b58; }
+
+    #stage {
+      position: relative;
+      min-height: 0;
+      overflow: hidden;
+      background: #111;
+    }
+
+    canvas { display: block; width: 100%; height: 100%; }
+
+    .instructions {
+      position: absolute;
+      inset: 16px auto auto 50%;
+      transform: translateX(-50%);
+      max-width: min(90%, 520px);
+      padding: 14px 18px;
+      background: #f7f8f3;
+      border-left: 4px solid #d88432;
+      color: #202523;
+      line-height: 1.45;
+      text-align: center;
+    }
+
+    .instructions .first-step { display: block; margin-bottom: 6px; font-size: 17px; color: #146b58; }
+    .instructions p { margin: 6px 0 0; font-size: 13px; color: #4e5a55; }
+    .instructions ol { margin: 8px 0 0; padding-left: 22px; text-align: left; }
+    .instructions li { margin: 4px 0; }
+    /* The step that comes next stands out; finished ones fade. */
+    .instructions li.done { color: #8a948f; }
+    .instructions li.next { font-weight: 650; }
+
+    body.presenting { display: block; overflow: hidden; background: #111; }
+    body.presenting .controls, body.presenting .fullscreen-only-before { display: none; }
+    /* Fullscreen: the directions stay up, in a column at the left edge, clear of the bullseye,
+       the corner markers and the step squares (all within ~18 cm of the center). */
+    body.presenting .instructions {
+      inset: 186px auto auto 12px;
+      transform: none;
+      max-width: min(22vw, 340px);
+      text-align: left;
+    }
+    /* Hidden while a grid or the white screen is up, so the phone sees them whole. */
+    body.running .instructions { display: none; }
+    /* During the lens steps: one short line at the very top, clear of the step squares. */
+    .lens-prompt {
+      display: none;
+      position: absolute;
+      top: 6px;
+      left: 50%;
+      transform: translateX(-50%);
+      max-width: 90%;
+      padding: 6px 14px;
+      background: #f7f8f3;
+      border-left: 4px solid #d88432;
+      color: #202523;
+      font-size: 15px;
+      font-weight: 600;
+      text-align: center;
+    }
+    body.lens-step .lens-prompt { display: block; }
+    body.presenting #stage { position: fixed; inset: 0; width: 100vw; height: 100vh; }
+
+    /* First page: what to set up and how a measurement goes. Return moves on to alignment. */
+    .setup-page {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      overflow: auto;
+      background: #f7f8f3;
+      color: #202523;
+      line-height: 1.5;
+    }
+    body.intro .setup-page { display: block; }
+    .setup-page-body { max-width: 760px; margin: 0 auto; padding: 32px 20px 48px; }
+    .setup-page h1 { font-size: 26px; }
+    .setup-page h2 { margin: 26px 0 6px; font-size: 18px; font-weight: 650; }
+    .setup-page ol { margin: 0; padding-left: 22px; }
+    .setup-page li { margin: 6px 0; }
+    .setup-page .note { color: #4e5a55; font-size: 14px; }
+    .setup-page kbd {
+      padding: 1px 6px;
+      border: 1px solid #aeb6ae;
+      border-radius: 3px;
+      background: #fff;
+      font: 13px ui-monospace, monospace;
+    }
+    .setup-page table { border-collapse: collapse; }
+    .setup-page td { padding: 3px 14px 3px 0; vertical-align: top; }
+    .setup-page .continue { margin-top: 28px; }
+
+    @media (max-width: 620px) {
+      .controls { align-items: end; }
+      .brand { width: 100%; }
+    }
+  </style>
+</head>
+<body class="intro">
+  <section id="intro" class="setup-page" aria-labelledby="introTitle">
+    <div class="setup-page-body">
+      <h1 id="introTitle">Lensometer: setup and procedure</h1>
+      <p class="note">The phone measures a lens by looking through it at patterns on this screen.
+        Read this once, then press <kbd>Return</kbd> to go to the alignment page.</p>
+
+      <h2>You need</h2>
+      <ol>
+        <li>The phone with the OpenLensometer app.</li>
+        <li>A tripod or stand that holds the phone still for the whole session.</li>
+        <li>The glasses, and a ruler.</li>
+      </ol>
+
+      <h2>Setup</h2>
+      <ol>
+        <li>Show this page on the monitor, with the brightness up and no lamp or window
+          reflecting in the screen.</li>
+        <li>Put the phone on the tripod with its back camera facing this browser window, square
+          to the screen, about 50 cm away and level with the middle of the screen. Leave it
+          there until you are done: the phone must not move between steps.</li>
+        <li>Start the app on the phone.</li>
+        <li>On the next page, set <em>Monitor diagonal</em> so the outer black ring of the
+          bullseye measures 50 mm with the ruler. The phone judges its distance from that size.
+          The setting is remembered.</li>
+      </ol>
+
+      <h2>Procedure</h2>
+      <ol>
+        <li><strong>Align.</strong> On the next page, go fullscreen first: press <kbd>F</kbd> or click
+          <em>Present fullscreen</em>. Move and
+          turn the tripod until the pink box on the phone sits on the phone's box. Keep both tilts
+          shown at the top of the phone screen (Tilt L/R and Tilt F/B) within 6° of zero and the
+          distance at 46–54 cm; the box turns green when the alignment is acceptable. Keep the
+          glasses out of view and press <kbd>Return</kbd> once: a grid is shown and the
+          phone records it as the reference.</li>
+        <li><strong>Lens size.</strong> Press <kbd>L</kbd>. On the white screen, hold the glasses
+          flat against the monitor with the lens to measure centered on the plus sign, for a few
+          seconds.</li>
+        <li><strong>Measure.</strong> The grid comes back by itself. Hold the glasses in front of
+          the camera, about 20 cm from it, arms toward the phone. Place the lens so it is
+          inside the outline the phone draws on its screen (it does not have to fill it), and
+          hold still until the phone beeps. The phone then shows sphere, cylinder and axis, and
+          the add for bifocals and progressives.</li>
+        <li><strong>Other lens.</strong> Press <kbd>L</kbd> again and repeat steps 2 and 3.</li>
+        <li><strong>Again.</strong> <kbd>G</kbd> measures the same lens again, using the lens shape
+          already taken (for example if time ran out); <kbd>L</kbd> retakes the shape as well.
+          The <em>Reset capture</em> button on the phone restarts the whole sequence from the
+          alignment.</li>
+      </ol>
+
+      <h2>Keys</h2>
+      <table>
+        <tr><td><kbd>Return</kbd></td><td>Continue from this page; on the alignment page, take the reference</td></tr>
+        <tr><td><kbd>F</kbd></td><td>Fullscreen (do this first on the alignment page)</td></tr>
+        <tr><td><kbd>L</kbd></td><td>White lens-size screen, then the grid measurement</td></tr>
+        <tr><td><kbd>G</kbd></td><td>Measure the same lens again, keeping its shape</td></tr>
+        <tr><td><em>Reset capture</em></td><td>Button on the phone: restart the whole sequence</td></tr>
+        <tr><td><kbd>Escape</kbd></td><td>Stop a measurement; leave fullscreen</td></tr>
+        <tr><td><kbd>H</kbd></td><td>Come back to this page</td></tr>
+      </table>
+
+      <button id="introContinue" class="primary continue">Continue to alignment (Return)</button>
+    </div>
+  </section>
+
+  <header class="controls">
+    <div class="brand">
+      <h1>Lensometer Fringe Player</h1>
+      <div id="readout" class="readout">X · 0° · 0 / 8</div>
+    </div>
+    <label>Fringe period (pixels)
+      <input id="period" type="number" min="8" max="2048" step="1" value="16">
+    </label>
+    <label>Contrast <span id="contrastValue">80%</span>
+      <input id="contrast" type="range" min="10" max="100" value="80">
+    </label>
+    <label>Monitor diagonal (inches) <span id="pitchValue"></span>
+      <input id="diagonal" type="number" min="10" max="100" step="0.1" value="27">
+    </label>
+    <label>Auto-advance every (seconds)
+      <span><input id="auto" type="checkbox" checked aria-label="Auto-advance">
+        <input id="autoSeconds" type="number" min="1" max="30" step="0.5" value="3"></span>
+    </label>
+    <button id="reset">Reset sequence</button>
+    <button id="present" class="primary">Present fullscreen</button>
+  </header>
+
+  <main id="stage">
+    <canvas id="pattern" aria-label="Sinusoidal fringe pattern"></canvas>
+    <div id="lensPrompt" class="lens-prompt"></div>
+    <div class="instructions">
+      <div class="fullscreen-only-before">
+        <strong class="first-step">Go fullscreen now: press F (or click Present fullscreen above).</strong>
+        <p>First, if you have not yet, set the monitor diagonal above so the outer black ring of
+          the bullseye measures 50 mm with a ruler; it is hidden in fullscreen. These directions
+          stay on screen in fullscreen.</p>
+      </div>
+      <ol>
+        <li id="stepAlign">Move and turn the tripod to put the pink box on the phone's box. Keep
+          both tilts (Tilt L/R and Tilt F/B, at the top of the phone screen) within 6° of zero
+          and the distance at 46–54 cm. The box turns green when the alignment is acceptable;
+          hold still a moment. Then, glasses out of view, press <strong>Return</strong>: a grid
+          shows briefly as the reference.</li>
+        <li id="stepSize">Press <strong>L</strong>. Hold the glasses flat against the white screen,
+          the lens to measure on the plus sign.</li>
+        <li id="stepMeasure">The grid comes by itself. Hold the glasses about 20 cm from the camera,
+          the lens inside the outline on the phone, until it beeps.</li>
+        <li id="stepOther">For the other lens press <strong>L</strong> again.
+          <strong>G</strong> measures the same lens again with the shape already taken;
+          <strong>L</strong> retakes the shape too. <em>Reset capture</em> on the phone restarts
+          the whole sequence: align and press <strong>Return</strong> as in step 1. <strong>H</strong> shows the setup page; Escape leaves
+          fullscreen.</li>
+      </ol>
+    </div>
+  </main>
+
+  <script>
+    (() => {
+      const phaseDegrees = [0, 90, 180, 270];
+      const BULLSEYE_HIDE_MS = 8000;
+      const markerSize = { width: 260, height: 160 };
+      const canvas = document.getElementById("pattern");
+      const lensPrompt = document.getElementById("lensPrompt");
+      const context = canvas.getContext("2d", { alpha: false });
+      const readout = document.getElementById("readout");
+      const periodInput = document.getElementById("period");
+      const contrastInput = document.getElementById("contrast");
+      const contrastValue = document.getElementById("contrastValue");
+      // The phone measures its distance from the bullseye's apparent size, so it must be
+      // drawn at this exact physical diameter (BULLSEYE_DIAMETER_MM in MainActivity.kt).
+      const BULLSEYE_DIAMETER_MM = 50;
+      // Smaller markers at (±CORNER_OFFSET_MM, ±CORNER_OFFSET_MM) from the center; the phone
+      // measures tilt from their perspective (CORNER_MARKER_OFFSET_MM in MainActivity.kt).
+      const CORNER_DIAMETER_MM = 30;
+      const CORNER_OFFSET_MM = 90;
+      // Extra copies of the step squares, readable while the bullseye is hidden. Each is laid
+      // out as if under a bullseye at [right, down] mm from center, putting the squares ~10 cm
+      // above, ~10 cm below, and ~15 cm either side of center: outside what a lens near the
+      // camera covers, and not all blocked at once by the hands holding the glasses
+      // (REMOTE_TICK_SPOTS_MM in MainActivity.kt).
+      const REMOTE_TICK_SPOTS_MM = [[0, -145], [0, 63], [-150, -41], [150, -41]];
+      // Step-square code shown on the white lens-size screen (LENS_SIZE_SCREEN_CODE in MainActivity.kt).
+      const LENS_SIZE_SCREEN_CODE = 1;
+      // Shown during the lens loop's countdown, so the phone can tell it from an idle START (0).
+      const LOOP_COUNTDOWN_CODE = 2;
+      const diagonalInput = document.getElementById("diagonal");
+      const pitchValue = document.getElementById("pitchValue");
+      try {
+        const saved = localStorage.getItem("monitorDiagonalInches");
+        if (saved) diagonalInput.value = saved;
+      } catch (_) {}
+      let axis = 0;
+      let phase = 0;
+      let started = false;
+      let complete = false;
+      let bullseyeHiddenUntilMs = 0;
+      let autoTimer = 0;
+      let lensSizeScreen = false;
+      // Set once the reference grid has been shown; reset() keeps it.
+      let referenceTaken = false;
+      // Single-frame method: a still crossed grid, X and Y fringes at once, 8 mm period so the
+      // phone camera resolves it (~8 camera pixels per period at 50 cm). Shown as the first
+      // page of the reference run (no-lens grid reference) and, after the white lens-size
+      // screen, for GRID_LENS_MS while the phone measures the lens frame by frame.
+      const GRID_CODE = 3;
+      const GRID_PERIOD_MM = 8;
+      const GRID_LENS_MS = 20000;
+      let gridPage = false;
+      let gridLens = false;
+      let gridLensEndsAtMs = 0;
+      let gridLensTimer = 0;
+      let gridCache = null;
+      // The phone needs ~1 s of steady readings plus a few seconds to place the glasses (~4 s);
+      // after twice that the white screen moves on to the lens loop by itself.
+      const LENS_SIZE_SCREEN_MS = 8000;
+      let lensSizeEndsAtMs = 0;
+      let lensSizeTimer = 0;
+      // R starts a hands-free lens run: a countdown, then the 8 pages repeat until L or RETURN.
+      const LOOP_COUNTDOWN_MS = 5000;
+      // Each lens-loop page shows this long (the phone takes 5 frames of it), so a whole run of
+      // 8 pages takes ~3 s; rounds are short, so allow plenty of retakes before stopping.
+      const LOOP_PAGE_MS = 400;
+      const MAX_LOOP_ROUNDS = 15;
+      let looping = false;
+      let loopRound = 0;
+      let loopStartsAtMs = 0;
+      let countdownTimer = 0;
+      const autoInput = document.getElementById("auto");
+      const autoSecondsInput = document.getElementById("autoSeconds");
+
+      function pixelSize() {
+        const ratio = window.devicePixelRatio || 1;
+        return {
+          width: Math.max(1, Math.round(canvas.clientWidth * ratio)),
+          height: Math.max(1, Math.round(canvas.clientHeight * ratio))
+        };
+      }
+
+      function draw() {
+        updateInstructionsVisibility();
+        if (!canvas.clientWidth || !canvas.clientHeight) return;
+        const { width, height } = pixelSize();
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+        }
+
+        const period = Math.max(8, Number.parseInt(periodInput.value, 10) || 16);
+        if (lensSizeScreen) {
+          drawLensSizeScreen(width, height);
+          updateReadout(period);
+          return;
+        }
+        if (gridPage || gridLens) {
+          drawGrid(width, height);
+          drawRemoteTicks(width / 2, height / 2, bullseyePixels(), GRID_CODE);
+          drawPhaseMarker(width, height, period);
+          updateReadout(period);
+          return;
+        }
+        const contrast = Number(contrastInput.value) / 100;
+        const length = axis === 0 ? width : height;
+        const strip = document.createElement("canvas");
+        strip.width = axis === 0 ? length : 1;
+        strip.height = axis === 0 ? 1 : length;
+        const stripContext = strip.getContext("2d", { alpha: false });
+        const image = stripContext.createImageData(strip.width, strip.height);
+        const phaseOffset = phase * Math.PI / 2;
+
+        for (let index = 0; index < length; index++) {
+          const intensity = Math.round(127.5 + 127.5 * contrast *
+            Math.cos(2 * Math.PI * index / period + phaseOffset));
+          const offset = index * 4;
+          image.data[offset] = intensity;
+          image.data[offset + 1] = intensity;
+          image.data[offset + 2] = intensity;
+          image.data[offset + 3] = 255;
+        }
+
+        stripContext.putImageData(image, 0, 0);
+        context.imageSmoothingEnabled = false;
+        context.drawImage(strip, 0, 0, width, height);
+        drawAlignmentTarget(
+          width,
+          height,
+          started ? 8 + axis * 4 + phase : looping ? LOOP_COUNTDOWN_CODE : 0,
+          bullseyePixels(),
+          Date.now() >= bullseyeHiddenUntilMs
+        );
+        drawPhaseMarker(width, height, period);
+        updateReadout(period);
+      }
+
+      function updateInstructionsVisibility() {
+        document.body.classList.toggle("running", (started && !complete) || lensSizeScreen || gridLens);
+        // Before the reference only step 1 is next; after it, the lens steps.
+        const referenceDone = complete || referenceTaken;
+        document.getElementById("stepAlign").className = referenceDone ? "done" : "next";
+        for (const id of ["stepSize", "stepMeasure", "stepOther"]) {
+          document.getElementById(id).className = referenceDone ? "next" : "";
+        }
+        document.body.classList.toggle("lens-step", lensSizeScreen || gridLens);
+        lensPrompt.textContent = lensSizeScreen
+          ? "Place the lens lightly against the plus sign at the center"
+          : gridLens
+            ? "Place the lens inside the outline shown on the phone's screen, and hold until you hear a beep"
+            : "";
+      }
+
+      // The crossed grid, I = mid + amp·(cos 2πx/p + cos 2πy/p), built once per size.
+      function drawGrid(width, height) {
+        const periodPixels = GRID_PERIOD_MM * bullseyePixels() / BULLSEYE_DIAMETER_MM;
+        const contrast = Number(contrastInput.value) / 100;
+        const key = `${width}x${height}:${periodPixels}:${contrast}`;
+        if (!gridCache || gridCache.key !== key) {
+          const offscreen = document.createElement("canvas");
+          offscreen.width = width;
+          offscreen.height = height;
+          const offscreenContext = offscreen.getContext("2d", { alpha: false });
+          const image = offscreenContext.createImageData(width, height);
+          const columns = new Float32Array(width);
+          for (let x = 0; x < width; x++) columns[x] = Math.cos(2 * Math.PI * x / periodPixels);
+          const amplitude = 127.5 * contrast / 2;
+          for (let y = 0; y < height; y++) {
+            const rowTerm = Math.cos(2 * Math.PI * y / periodPixels);
+            for (let x = 0; x < width; x++) {
+              const intensity = Math.round(127.5 + amplitude * (columns[x] + rowTerm));
+              const offset = (y * width + x) * 4;
+              image.data[offset] = intensity;
+              image.data[offset + 1] = intensity;
+              image.data[offset + 2] = intensity;
+              image.data[offset + 3] = 255;
+            }
+          }
+          offscreenContext.putImageData(image, 0, 0);
+          gridCache = { key, canvas: offscreen };
+        }
+        context.drawImage(gridCache.canvas, 0, 0);
+      }
+
+      // Plain bright screen so the phone can see the dark rim of glasses held flat against it.
+      function drawLensSizeScreen(width, height) {
+        context.fillStyle = "rgb(255,255,255)";
+        context.fillRect(0, 0, width, height);
+        const pixelsPerMm = bullseyePixels() / BULLSEYE_DIAMETER_MM;
+        const arm = 5 * pixelsPerMm;
+        context.strokeStyle = "rgb(0,0,0)";
+        context.lineWidth = Math.max(1, 0.8 * pixelsPerMm);
+        context.beginPath();
+        context.moveTo(width / 2 - arm, height / 2);
+        context.lineTo(width / 2 + arm, height / 2);
+        context.moveTo(width / 2, height / 2 - arm);
+        context.lineTo(width / 2, height / 2 + arm);
+        context.stroke();
+        // Tells the phone this is the lens-size screen (code 1; fringe pages use 0 and 8–15).
+        const size = bullseyePixels();
+        drawRemoteTicks(width / 2, height / 2, size, LENS_SIZE_SCREEN_CODE);
+        context.fillStyle = "rgb(90,90,90)";
+        context.font = `${Math.round(6 * pixelsPerMm)}px sans-serif`;
+        context.textAlign = "center";
+        const secondsLeft = Math.max(1, Math.ceil((lensSizeEndsAtMs - Date.now()) / 1000));
+        context.fillText(`Lens size: hold the glasses flat here, lens on the cross · ${secondsLeft} s`,
+          width / 2, height / 2 + 130 * pixelsPerMm);
+        context.fillText("Then hold them in front of the camera; the grid measurement starts by itself",
+          width / 2, height / 2 + 142 * pixelsPerMm);
+        context.textAlign = "start";
+      }
+
+      function nativeResolution() {
+        const ratio = window.devicePixelRatio || 1;
+        return {
+          width: Math.round(screen.width * ratio),
+          height: Math.round(screen.height * ratio)
+        };
+      }
+
+      function bullseyePixels() {
+        const { width, height } = nativeResolution();
+        const diagonal = Number(diagonalInput.value) || 27;
+        const pitchMm = 25.4 * diagonal / Math.hypot(width, height);
+        pitchValue.textContent = `${width}×${height} · ${pitchMm.toFixed(3)} mm/px`;
+        return Math.round(BULLSEYE_DIAMETER_MM / pitchMm);
+      }
+
+      function drawRings(x, y, diameter) {
+        for (const [radius, color] of [[0.5, "rgb(0,0,0)"], [0.4, "rgb(255,210,0)"],
+                                       [0.2, "rgb(0,0,0)"]]) {
+          context.fillStyle = color;
+          context.beginPath();
+          context.arc(x, y, diameter * radius, 0, 2 * Math.PI);
+          context.fill();
+        }
+      }
+
+      function drawAlignmentTarget(width, height, phaseCode, size, bullseyeVisible) {
+        const centerX = width / 2;
+        const centerY = height / 2;
+        if (bullseyeVisible) {
+          drawRings(centerX, centerY, size);
+          // Corner markers let the phone measure its tilt from perspective.
+          const pixelsPerMm = size / BULLSEYE_DIAMETER_MM;
+          const offset = CORNER_OFFSET_MM * pixelsPerMm;
+          // Alignment box through the corner markers; the phone draws where it should appear.
+          context.strokeStyle = "rgb(0,0,0)";
+          context.lineWidth = Math.max(2, 2.5 * pixelsPerMm);
+          context.strokeRect(centerX - offset, centerY - offset, 2 * offset, 2 * offset);
+          for (const sx of [-1, 1]) {
+            for (const sy of [-1, 1]) {
+              drawRings(centerX + sx * offset, centerY + sy * offset,
+                CORNER_DIAMETER_MM * pixelsPerMm);
+            }
+          }
+        }
+
+        // Step squares under the bullseye only while it shows: during a lens run they would
+        // sit in the area seen through the lens. The copy further down is always readable.
+        if (bullseyeVisible) drawPhaseTicks(centerX, centerY, size, phaseCode);
+        drawRemoteTicks(centerX, centerY, size, phaseCode);
+      }
+
+      function drawRemoteTicks(centerX, centerY, size, phaseCode) {
+        const pixelsPerMm = size / BULLSEYE_DIAMETER_MM;
+        for (const [right, down] of REMOTE_TICK_SPOTS_MM) {
+          drawPhaseTicks(centerX + right * pixelsPerMm, centerY + down * pixelsPerMm, size, phaseCode);
+        }
+      }
+
+      // Four squares (bit 0 leftmost, white = 1) laid out relative to a bullseye of this size
+      // centered at (centerX, centerY); alignment_detector.cpp reads them with the same layout.
+      function drawPhaseTicks(centerX, centerY, size, phaseCode) {
+        // Mid-grey gaps let the phone confirm it is reading squares, not blank screen.
+        // Big enough for the camera: at 50 cm a 10 mm square is only ~10 camera pixels.
+        const cellSize = size * 0.20;
+        const cellGap = size * 0.16;
+        const margin = size * 0.12;
+        const codeWidth = cellSize * 4 + cellGap * 3;
+        const codeLeft = centerX - codeWidth / 2;
+        const codeTop = centerY + size * 0.72;
+        context.fillStyle = "rgb(128,128,128)";
+        context.fillRect(codeLeft - margin, codeTop - margin,
+          codeWidth + 2 * margin, cellSize + 2 * margin);
+        for (let bit = 0; bit < 4; bit++) {
+          const isSet = (phaseCode & (1 << bit)) !== 0;
+          const cellLeft = codeLeft + bit * (cellSize + cellGap);
+          context.fillStyle = isSet ? "rgb(255,255,255)" : "rgb(0,0,0)";
+          context.fillRect(cellLeft, codeTop, cellSize, cellSize);
+          context.strokeStyle = "rgb(0,0,0)";
+          context.lineWidth = 2;
+          context.strokeRect(cellLeft, codeTop, cellSize, cellSize);
+        }
+      }
+
+      function drawPhaseMarker(width, height, period) {
+        const markerWidth = Math.min(markerSize.width, width);
+        const markerHeight = Math.min(markerSize.height, height);
+        const x = 12;
+        const y = 12;
+        context.fillStyle = "rgb(245,245,245)";
+        context.fillRect(x, y, markerWidth, markerHeight);
+        context.strokeStyle = "rgb(0,0,0)";
+        context.lineWidth = 4;
+        context.strokeRect(x + 2, y + 2, markerWidth - 4, markerHeight - 4);
+
+        context.fillStyle = "rgb(0,0,0)";
+        context.font = "bold 26px monospace";
+        context.textBaseline = "top";
+        context.fillText(
+          complete ? "DONE" : !started ? "START" : `${axis === 0 ? "X" : "Y"}  ${phaseDegrees[phase]}°`,
+          x + 14,
+          y + 12
+        );
+        context.font = "16px monospace";
+        context.fillText(
+          complete ? "STEP 8/8"
+            : gridLens ? `GRID ${Math.max(1, Math.ceil((gridLensEndsAtMs - Date.now()) / 1000))} s`
+            : gridPage ? "GRID (ref)"
+            : !started && looping
+              ? `STARTS IN ${Math.max(1, Math.ceil((loopStartsAtMs - Date.now()) / 1000))} s`
+              : !started ? "PRESS RETURN" : `STEP ${axis * 4 + phase + 1}/8${looping ? ` (round ${loopRound}/${MAX_LOOP_ROUNDS})` : ""}`,
+          x + 14,
+          y + 49
+        );
+        context.fillText(`${width}×${height} · ${period}px`, x + 14, y + 75);
+        context.font = "14px monospace";
+        context.fillText("RETURN start/next", x + 14, y + 104);
+        context.fillText("L lens size  G again", x + 14, y + 126);
+      }
+
+      function updateReadout(period) {
+        readout.textContent = gridLens
+          ? `GRID LENS · ${Math.max(1, Math.ceil((gridLensEndsAtMs - Date.now()) / 1000))} s left`
+          : gridPage
+            ? "GRID reference"
+          : complete
+          ? `COMPLETE · ${period}px period`
+          : !started && looping
+            ? `LENS LOOP · starts in ${Math.max(1, Math.ceil((loopStartsAtMs - Date.now()) / 1000))} s`
+          : !started
+            ? `READY · press Return to begin · ${period}px period`
+            : `${axis === 0 ? "X" : "Y"} · ${phaseDegrees[phase]}° · ${axis * 4 + phase + 1} / 8 · ${period}px`;
+      }
+
+      function autoRunning() {
+        return (autoInput.checked || looping) && started && !complete;
+      }
+
+      function showLensSizeScreen() {
+        reset();
+        lensSizeScreen = true;
+        lensSizeEndsAtMs = Date.now() + LENS_SIZE_SCREEN_MS;
+        lensSizeTimer = window.setInterval(() => {
+          if (Date.now() < lensSizeEndsAtMs) {
+            draw();
+            return;
+          }
+          startGridLens();
+        }, 250);
+        draw();
+      }
+
+      function startGridLens() {
+        reset();
+        lensSizeScreen = false;
+        gridLens = true;
+        gridLensEndsAtMs = Date.now() + GRID_LENS_MS;
+        gridLensTimer = window.setInterval(() => {
+          if (Date.now() < gridLensEndsAtMs) {
+            draw();
+            return;
+          }
+          reset();
+        }, 500);
+        draw();
+      }
+
+      function hideLensSizeScreen() {
+        window.clearInterval(lensSizeTimer);
+        lensSizeTimer = 0;
+        lensSizeScreen = false;
+        draw();
+      }
+
+      function startLoop() {
+        reset();
+        lensSizeScreen = false;
+        looping = true;
+        loopRound = 1;
+        loopStartsAtMs = Date.now() + LOOP_COUNTDOWN_MS;
+        countdownTimer = window.setInterval(() => {
+          if (Date.now() < loopStartsAtMs) {
+            draw();
+            return;
+          }
+          window.clearInterval(countdownTimer);
+          countdownTimer = 0;
+          advance();
+        }, 250);
+        draw();
+      }
+
+      // (Re)starts the countdown to the next page; any manual key resets it.
+      function scheduleAuto() {
+        window.clearTimeout(autoTimer);
+        autoTimer = 0;
+        if (!autoRunning()) return;
+        // The lens loop flips fast so hand-held glasses only need to stay still ~2.5 s per run.
+        const milliseconds = looping
+          ? LOOP_PAGE_MS
+          : Math.max(1, Number(autoSecondsInput.value) || 3) * 1000;
+        autoTimer = window.setTimeout(() => {
+          autoTimer = 0;
+          advance();
+        }, milliseconds);
+      }
+
+      function advance() {
+        if (!started) {
+          started = true;
+          // The reference run opens with the grid, for the single-frame method's reference.
+          gridPage = !looping;
+          hideBullseye();
+          scheduleAuto();
+          return;
+        }
+        if (gridPage) {
+          // The grid is the whole reference run now; bring the bullseye back.
+          gridPage = false;
+          referenceTaken = true;
+          complete = true;
+          bullseyeHiddenUntilMs = 0;
+          draw();
+          return;
+        }
+        if (complete) {
+          reset();
+          return;
+        }
+        if (phase < 3) {
+          phase++;
+        } else if (axis === 0) {
+          axis = 1;
+          phase = 0;
+        } else if (looping && loopRound < MAX_LOOP_ROUNDS) {
+          // Hands-free lens run: go round again so a disturbed attempt can be retaken.
+          loopRound++;
+          axis = 0;
+          phase = 0;
+        } else if (looping) {
+          reset();
+          return;
+        } else {
+          complete = true;
+        }
+        if (complete) {
+          bullseyeHiddenUntilMs = 0;
+          draw();
+        } else {
+          hideBullseye();
+        }
+        scheduleAuto();
+      }
+
+      function hideBullseye() {
+        if (autoRunning()) {
+          // Keep the fringes clean for the whole run.
+          bullseyeHiddenUntilMs = Infinity;
+          draw();
+          return;
+        }
+        bullseyeHiddenUntilMs = Date.now() + BULLSEYE_HIDE_MS;
+        draw();
+        window.setTimeout(() => {
+          if (Date.now() >= bullseyeHiddenUntilMs) draw();
+        }, BULLSEYE_HIDE_MS + 10);
+      }
+
+      function reset() {
+        window.clearTimeout(autoTimer);
+        autoTimer = 0;
+        window.clearInterval(countdownTimer);
+        countdownTimer = 0;
+        window.clearInterval(lensSizeTimer);
+        lensSizeTimer = 0;
+        window.clearInterval(gridLensTimer);
+        gridLensTimer = 0;
+        gridPage = false;
+        gridLens = false;
+        looping = false;
+        axis = 0;
+        phase = 0;
+        started = false;
+        complete = false;
+        bullseyeHiddenUntilMs = 0;
+        draw();
+      }
+
+      function showIntro(show) {
+        document.body.classList.toggle("intro", show);
+        if (!show) draw();
+      }
+
+      document.addEventListener("keydown", event => {
+        if (document.body.classList.contains("intro")) {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            showIntro(false);
+          }
+          return;
+        }
+        if (event.key.toLowerCase() === "f") {
+          presentFullscreen();
+        } else if (event.key.toLowerCase() === "h") {
+          reset();
+          showIntro(true);
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          // Leaving the white lens-size screen is part of starting a run.
+          if (lensSizeScreen) {
+            hideLensSizeScreen();
+            return;
+          }
+          if (looping || gridLens) {
+            reset();
+            return;
+          }
+          advance();
+        } else if (event.key.toLowerCase() === "l") {
+          if (lensSizeScreen) {
+            hideLensSizeScreen();
+          } else {
+            showLensSizeScreen();
+          }
+        } else if (event.key.toLowerCase() === "g") {
+          startGridLens();
+        } else if (event.key.toLowerCase() === "r") {
+          // Same as G: measure again with the grid.
+          startGridLens();
+        } else if (event.key === "Escape" && (looping || gridLens)) {
+          reset();
+        }
+      });
+
+      document.getElementById("reset").addEventListener("click", reset);
+      document.getElementById("introContinue").addEventListener("click", () => showIntro(false));
+      autoInput.addEventListener("change", () => {
+        scheduleAuto();
+        if (!autoInput.checked && bullseyeHiddenUntilMs === Infinity) hideBullseye();
+        updateReadout(Math.max(8, Number.parseInt(periodInput.value, 10) || 16));
+      });
+      async function presentFullscreen() {
+        if (document.fullscreenElement) return;
+        document.body.classList.add("presenting");
+        draw();
+        try {
+          await document.documentElement.requestFullscreen();
+        } catch (_) {
+          document.body.classList.remove("presenting");
+          draw();
+        }
+      }
+
+      document.getElementById("present").addEventListener("click", presentFullscreen);
+
+      document.addEventListener("fullscreenchange", () => {
+        document.body.classList.toggle("presenting", Boolean(document.fullscreenElement));
+        draw();
+      });
+      periodInput.addEventListener("input", draw);
+      contrastInput.addEventListener("input", () => {
+        contrastValue.textContent = `${contrastInput.value}%`;
+        draw();
+      });
+      diagonalInput.addEventListener("input", () => {
+        try { localStorage.setItem("monitorDiagonalInches", diagonalInput.value); } catch (_) {}
+        draw();
+      });
+      window.addEventListener("resize", draw);
+      window.addEventListener("orientationchange", draw);
+      draw();
+    })();
+  </script>
+</body>
+</html>
