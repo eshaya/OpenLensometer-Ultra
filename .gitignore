@@ -25,3 +25,9 @@ local.properties
 
 # C++ CMake build folders
 app/src/main/cpp/build/
+
+# OpenCV Android SDK (~1 GB): download it instead, see README.md
+app/src/main/cpp/opencv/
+
+# JVM heap dumps
+*.hprof
