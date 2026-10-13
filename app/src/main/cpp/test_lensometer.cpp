@@ -546,9 +546,7 @@ TEST(GridMeasurementTest, DetectsProgressiveLens) {
     EXPECT_GT(result.nearSphere, centerPower);
 }
 
-// Known gap: a bifocal's segment line breaks the fringes, which cuts the lens area in two;
-// only the part containing the center is measured, so the segment is missed.
-TEST(GridMeasurementTest, DISABLED_DetectsBifocalLens) {
+TEST(GridMeasurementTest, DetectsBifocalLens) {
     // +1.00 distance, +2.50 add in a segment below 5 mm under the lens center.
     constexpr double distancePower = 1.0;
     constexpr double add = 2.5;

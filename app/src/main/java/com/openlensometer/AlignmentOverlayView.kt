@@ -18,8 +18,14 @@ class AlignmentOverlayView(context: Context) : View(context) {
 
     class Reading(val label: String, val value: String, val inRange: Boolean)
 
-    /** Lens step: where the lens should appear, and its size at the right distance (view px). */
-    class LensGuide(val centerX: Float, val centerY: Float, val radius: Float, val measuring: Boolean)
+    /**
+     * Lens step: where the lens should appear, and its size at the right distance (view px).
+     * outline, if known, is the lens's own shape as x, y pairs in view pixels.
+     */
+    class LensGuide(
+        val centerX: Float, val centerY: Float, val radius: Float, val measuring: Boolean,
+        val outline: FloatArray? = null
+    )
 
     class State(
         /** Where the monitor's box should appear, in view pixels (null: not lining up). */
@@ -98,12 +104,27 @@ class AlignmentOverlayView(context: Context) : View(context) {
     private fun drawLensGuide(canvas: Canvas, guide: LensGuide) {
         val color = if (guide.measuring) Color.GREEN else Color.CYAN
         targetPaint.color = color
-        canvas.drawCircle(guide.centerX, guide.centerY, guide.radius, targetPaint)
+        val outline = guide.outline
+        var bottom = guide.centerY + guide.radius
+        if (outline != null && outline.size >= 6 && outline.all { it.isFinite() }) {
+            val path = Path()
+            path.moveTo(outline[0], outline[1])
+            for (index in 2 until outline.size step 2) path.lineTo(outline[index], outline[index + 1])
+            path.close()
+            canvas.drawPath(path, targetPaint)
+            bottom = (1 until outline.size step 2).maxOf { outline[it] }
+        } else {
+            canvas.drawCircle(guide.centerX, guide.centerY, guide.radius, targetPaint)
+        }
         labelPaint.color = color
         labelPaint.textAlign = Paint.Align.CENTER
         canvas.drawText(
-            if (guide.measuring) "Measuring: hold still" else "Fill this circle with the lens",
-            guide.centerX, guide.centerY + guide.radius + labelPaint.textSize * 1.4f, labelPaint
+            when {
+                guide.measuring -> "Measuring: hold still"
+                outline != null -> "Fit the lens to this outline (about 20 cm away)"
+                else -> "Center the lens here, about 20 cm away"
+            },
+            guide.centerX, bottom + labelPaint.textSize * 1.4f, labelPaint
         )
         labelPaint.textAlign = Paint.Align.LEFT
     }

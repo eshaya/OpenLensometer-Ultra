@@ -83,8 +83,11 @@ public class NativeLensEngine {
      */
     public native float[] saveReferenceRun(float monitorDownX, float monitorDownY);
 
-    /** Lens opening size (sqrt of area, pixels) with glasses flat on the screen, or -1. */
-    public native float measureLensOpening(
+    /**
+     * Lens opening with glasses flat on the screen: {size (sqrt of area, pixels), then the
+     * outline as x, y pairs in image pixels}, or null if no rim was found.
+     */
+    public native float[] measureLensOutline(
             ByteBuffer yPlane, int width, int height, int rowStride, int pixelStride,
             float centerX, float centerY, float minSizePixels);
 

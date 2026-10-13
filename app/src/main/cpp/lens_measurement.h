@@ -1,6 +1,7 @@
 #ifndef LENS_MEASUREMENT_H
 #define LENS_MEASUREMENT_H
 
+#include <limits>
 #include <opencv2/core.hpp>
 
 // Two-run deflectometry: a reference run (no lens) and a lens run, each with X and Y fringe
@@ -47,13 +48,20 @@ struct LensMeasurement {
     double nearCylinder = 0.0;
     double nearAxis = 0.0;
     double addPower = 0.0;
+    // Roll of the glasses (degrees counterclockwise as seen on the monitor) from the lines
+    // resting on the tops and bottoms of both lens shapes, and half their disagreement; NaN
+    // if not found. Adding the roll to an axis gives the axis relative to the frame.
+    double tiltDegrees = std::numeric_limits<double>::quiet_NaN();
+    double tiltErrorDegrees = std::numeric_limits<double>::quiet_NaN();
 };
 
 // Lens opening (sqrt of its area, in pixels) in a photo of glasses held flat against a bright
 // screen: the bright hole inside the dark rim that contains screenCenter. minSizePixels
-// rejects small holes such as the gap inside the centering mark.
+// rejects small holes such as the gap inside the centering mark. outline, if given, receives
+// the opening's outline in image pixels.
 bool measureLensOpening(const cv::Mat& grayscaleFrame, const cv::Point2f& screenCenter,
-                        double minSizePixels, double& openingPixels);
+                        double minSizePixels, double& openingPixels,
+                        std::vector<cv::Point>* outline = nullptr);
 
 // Camera pixels per fringe period along each monitor axis in a reference run; small values
 // mean the fringes are too fine for the camera to resolve well.
@@ -79,6 +87,10 @@ LensMeasurement measureLensPower(
         const cv::Point2f& monitorDown, const cv::Point2f& lensCenterGuess,
         double screenDistanceMm, double screenOpeningPixels, cv::Mat* brightnessRatio = nullptr,
         double assumedLensDistanceMm = 140.0);
+
+// Middle of the lens nearest centerGuess (rim-based), for tuning to that lens. False if none.
+bool locateLens(const FringeRun& reference, const FringeRun& lens,
+                const cv::Point2f& centerGuess, cv::Point2f& lensCenter);
 
 // Same, with the lens distance already known (used by tests).
 LensMeasurement measureLensPowerAtDistance(

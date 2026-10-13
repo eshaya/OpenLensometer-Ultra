@@ -625,7 +625,9 @@ Java_com_openlensometer_engine_NativeLensEngine_measureGridFrame(
         static_cast<jfloat>(measurement.nearSphere),
         static_cast<jfloat>(measurement.nearCylinder),
         static_cast<jfloat>(measurement.nearAxis),
-        static_cast<jfloat>(measurement.addPower)
+        static_cast<jfloat>(measurement.addPower),
+        static_cast<jfloat>(measurement.tiltDegrees),
+        static_cast<jfloat>(measurement.tiltErrorDegrees)
     };
     constexpr jsize valueCount = sizeof(values) / sizeof(values[0]);
     jfloatArray result = env->NewFloatArray(valueCount);
@@ -633,28 +635,42 @@ Java_com_openlensometer_engine_NativeLensEngine_measureGridFrame(
     return result;
 }
 
-// Size of the lens opening (sqrt of area, image pixels) with the glasses held flat on the
-// bright screen, or -1 if no rim is found around (centerX, centerY).
-JNIEXPORT jfloat JNICALL
-Java_com_openlensometer_engine_NativeLensEngine_measureLensOpening(
+// Lens opening with the glasses held flat on the bright screen: {size (sqrt of area, image
+// pixels), then the outline as x, y pairs in image pixels (at most ~100 points)}, or null if
+// no rim is found around (centerX, centerY).
+JNIEXPORT jfloatArray JNICALL
+Java_com_openlensometer_engine_NativeLensEngine_measureLensOutline(
         JNIEnv* env, jobject /* this */, jobject yPlane,
         jint width, jint height, jint rowStride, jint pixelStride,
         jfloat centerX, jfloat centerY, jfloat minSizePixels) {
-    if (width <= 0 || height <= 0 || rowStride < width || pixelStride != 1) return -1.0f;
+    if (width <= 0 || height <= 0 || rowStride < width || pixelStride != 1) return nullptr;
     auto* yData = static_cast<uint8_t*>(env->GetDirectBufferAddress(yPlane));
     const jlong capacity = env->GetDirectBufferCapacity(yPlane);
     const jlong requiredBytes = static_cast<jlong>(rowStride) * (height - 1) + width;
-    if (!yData || capacity < requiredBytes) return -1.0f;
+    if (!yData || capacity < requiredBytes) return nullptr;
     try {
         const cv::Mat frame(height, width, CV_8UC1, yData, static_cast<size_t>(rowStride));
         double opening = 0.0;
-        if (!measureLensOpening(frame, cv::Point2f(centerX, centerY), minSizePixels, opening)) {
-            return -1.0f;
+        std::vector<cv::Point> outline;
+        if (!measureLensOpening(frame, cv::Point2f(centerX, centerY), minSizePixels, opening,
+                                &outline)) {
+            return nullptr;
         }
-        return static_cast<jfloat>(opening);
+        // Simplified to within a pixel: plenty for drawing it on the preview.
+        std::vector<cv::Point> simplified;
+        cv::approxPolyDP(outline, simplified, 1.0, true);
+        std::vector<jfloat> values;
+        values.push_back(static_cast<jfloat>(opening));
+        for (const cv::Point& point : simplified) {
+            values.push_back(static_cast<jfloat>(point.x));
+            values.push_back(static_cast<jfloat>(point.y));
+        }
+        jfloatArray result = env->NewFloatArray(static_cast<jsize>(values.size()));
+        if (result) env->SetFloatArrayRegion(result, 0, static_cast<jsize>(values.size()), values.data());
+        return result;
     } catch (const cv::Exception& error) {
         LOGE("Lens opening measurement failed: %s", error.what());
-        return -1.0f;
+        return nullptr;
     }
 }
 
